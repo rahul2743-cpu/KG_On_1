@@ -1,0 +1,47 @@
+# ══════════════════════════════════════════════════════════
+# CELL 2 — Imports
+# ══════════════════════════════════════════════════════════
+
+# ----------------------------
+# Python Utilities
+# ----------------------------
+import os
+import re
+import json
+import time
+from pathlib import Path
+from collections import Counter, defaultdict
+from typing import Literal, Optional
+from dataclasses import dataclass
+
+# ----------------------------
+# XML Processing
+# ----------------------------
+from lxml import etree          # streams past base64 <attachment> blobs
+
+# ----------------------------
+# Data
+# ----------------------------
+import pandas as pd
+from tqdm.auto import tqdm
+
+# ----------------------------
+# Spark (Databricks)
+# ----------------------------
+from pyspark.sql import Row
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType, ArrayType
+
+# ----------------------------
+# Knowledge Graph
+# ----------------------------
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# LLM (in-workspace serving)
+# ----------------------------
+from databricks_langchain import ChatDatabricks
+from pydantic import BaseModel, Field
+
+print("✅ Imports loaded")
