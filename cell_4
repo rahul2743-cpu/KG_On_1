@@ -20,7 +20,9 @@ print("=" * 80)
 print(f"Total XML Documents : {raw_df.count()}")
 
 # ----------------------------------------------------------
-# Match XML Paths  (rename eval's source to avoid ambiguity)
+# Match XML Paths
+# raw_df already has its own doc_id -> that is the authoritative one.
+# Only bring "source" from top50_sources to join on; drop its doc_id.
 # ----------------------------------------------------------
 
 matched_xml = (
@@ -30,8 +32,7 @@ matched_xml = (
     .join(
 
         top50_sources.select(
-            F.col("source").alias("eval_source"),
-            "doc_id"
+            F.col("source").alias("eval_source")
         ).alias("eval"),
 
         F.col("raw.source") == F.col("eval.eval_source"),
@@ -43,13 +44,10 @@ matched_xml = (
 )
 
 # ----------------------------------------------------------
-# Keep Only the LATEST Version per doc_id
-# (raw table stores full version history — plain dropDuplicates
-#  picks an arbitrary row, not the latest, and can silently
-#  under-count when versions tie or ordering shifts)
+# Keep Only the LATEST Version per doc_id (raw's doc_id)
 # ----------------------------------------------------------
 
-version_window = Window.partitionBy("doc_id").orderBy(
+version_window = Window.partitionBy("raw.doc_id").orderBy(
     F.col("content_update_date").desc()
 )
 
@@ -75,7 +73,7 @@ matched_xml = (
 
     .select(
 
-        "doc_id",
+        F.col("raw.doc_id").alias("doc_id"),
         "title",
         "content",
         "reference",
@@ -91,7 +89,7 @@ matched_xml = (
 n_matched = matched_xml.count()
 
 # ----------------------------------------------------------
-# Diagnostics — where did documents get lost?
+# Diagnostics
 # ----------------------------------------------------------
 
 n_seed = top50_sources.count()
@@ -101,16 +99,16 @@ print("=" * 80)
 print("MATCHED XML DOCUMENTS")
 print("=" * 80)
 
-print(f"Seed documents (cell 3)  : {n_seed}")
-print(f"Matched XML documents    : {n_matched}")
+print(f"Seed documents (cell 3) : {n_seed}")
+print(f"Matched XML documents   : {n_matched}")
 
 if n_matched < n_seed:
     missing = (
         top50_sources
-        .select(F.col("source").alias("eval_source"), "doc_id")
+        .select(F.col("source").alias("eval_source"))
         .join(
-            matched_xml.select("doc_id"),
-            on="doc_id",
+            matched_xml.select("source"),
+            top50_sources["source"] == matched_xml["source"],
             how="left_anti"
         )
     )
