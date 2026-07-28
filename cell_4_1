@@ -1,0 +1,122 @@
+# ==========================================================
+# Cell 5 : XML Content Cleaning
+# ==========================================================
+
+import re
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+
+print("=" * 80)
+print("XML CONTENT CLEANING")
+print("=" * 80)
+
+# Keep raw content untouched under a new name — never overwrite it.
+xml_df = matched_xml.withColumnRenamed("content", "content_raw")
+print(f"Documents to clean : {xml_df.count()}")
+
+def clean_xwiki_text(raw_text: str) -> str:
+    """
+    Cleans XWiki 2.1 markup to readable text.
+    Doc links are kept as <doc:Ref> / <doc:wiki:Ref> markers —
+    not deleted, not resolved to plain text — so they stay
+    both human-readable in context AND machine-extractable
+    downstream (cell 6 link graph, cell 8+ entity extraction).
+    """
+    if not raw_text:
+        return ""
+    text = raw_text
+
+    # 1. CDATA
+    text = re.sub(r"<!\[CDATA\[|\]\]>", "", text)
+    # 2. Strip real HTML tags only — don't touch our own <doc:...> markers
+    text = re.sub(r"<(?!doc:)[^>]+>", " ", text)
+
+    # 3. Escaped-bracket thumbnail image wrapper -> drop entirely
+    text = re.sub(r"\[\[~\[~\[image:.*?attach:[^\]]*\]\]", "", text, flags=re.DOTALL)
+
+    # 4. Plain image/file/attach macros -> drop entirely
+    text = re.sub(r"\[\[\s*image:.*?\]\]", "", text, flags=re.DOTALL)
+    text = re.sub(r"\[\[\s*file:.*?\]\]",  "", text, flags=re.DOTALL)
+    text = re.sub(r"attach:\S+", "", text)
+
+    # 5. [[Label>>doc:Ref]] / [[Label>>doc:wiki:Ref]] -> <doc:Ref> / <doc:wiki:Ref>
+    text = re.sub(
+        r"\[\[\s*[^\[\]>]*?>>\s*doc:(wiki:)?([^\]\|]+?)(?:\|\|[^\]]*)?\]\]",
+        lambda m: f"<doc:wiki:{m.group(2).strip()}>" if m.group(1)
+                  else f"<doc:{m.group(2).strip()}>",
+        text,
+    )
+
+    # 6. [[doc:Ref]] / [[doc:wiki:Ref]] -> <doc:Ref> / <doc:wiki:Ref>
+    text = re.sub(
+        r"\[\[\s*doc:(wiki:)?([^\]\|]+?)(?:\|\|[^\]]*)?\]\]",
+        lambda m: f"<doc:wiki:{m.group(2).strip()}>" if m.group(1)
+                  else f"<doc:{m.group(2).strip()}>",
+        text,
+    )
+
+    # 7. Non-doc wiki links (external URLs, plain labels) -> keep just label text
+    text = re.sub(r"\[\[\s*(?P<label>[^\[\]>]*?)>>[^\]]+\]\]",
+                   lambda m: m.group("label").strip(), text)
+    text = re.sub(r"\[\[\s*(?P<label>[^\[\]]+?)\]\]",
+                   lambda m: m.group("label").strip(), text)
+
+    # 8. Macros {{{...}}} and {{...}}
+    text = re.sub(r"\{\{\{.*?\}\}\}", "", text, flags=re.DOTALL)
+    text = re.sub(r"\{\{.*?\}\}", "", text, flags=re.DOTALL)
+
+    # 9. (% class="x" %) style macros
+    text = re.sub(r"\(%.*?%\)", "", text)
+
+    # 10. ((( ))) container/box macros -> remove markers only
+    text = re.sub(r"\(\(\(|\)\)\)", "", text)
+
+    # 11. Headings: == Heading == -> Heading (own line)
+    text = re.sub(r"={2,}\s*(.*?)\s*={2,}", r"\n\1\n", text)
+
+    # 12. Horizontal rules
+    text = re.sub(r"^-{3,}$", "", text, flags=re.MULTILINE)
+
+    # 13. Formatting symbols: bold/italic/underline/strike/monospace
+    text = re.sub(r"\*\*|//|__|~~|##", "", text)
+
+    # 14. Leftover escape markers ~[ ~] ~|
+    text = re.sub(r"~[\[\]|]", "", text)
+
+    # 15. Empty parens left behind by macro removal
+    text = re.sub(r"\(\s*\)", "", text)
+
+    # 16. Export-control footer table
+    text = re.sub(r"\|=?Jurisdiction\|.*?(?:\n|$).*?(?:\n|$)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\|\s*[\w\s]+\|\s*(?:Not listed|[\w\s]+)\|\s*\d{4}-\d{2}-\d{2}", "", text)
+
+    # 17. Whitespace normalize
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+
+    return text.strip()
+
+
+clean_udf = F.udf(clean_xwiki_text, StringType())
+xml_df = xml_df.withColumn("content_clean", clean_udf(F.col("content_raw")))
+
+xml_df = (
+    xml_df
+    .withColumn("title",     F.trim(F.col("title")))
+    .withColumn("reference", F.trim(F.col("reference")))
+    .withColumn("source",    F.trim(F.col("source")))
+).cache()
+
+print()
+print("=" * 80)
+print("CLEAN XML DATA")
+print("=" * 80)
+print(f"Documents ready : {xml_df.count()}")
+
+sample = xml_df.limit(1).collect()[0]
+print("\n--- CLEAN (first 800 chars) ---")
+print(sample["content_clean"][:800])
+
+print()
+display(xml_df.select("doc_id", "title", "content_raw", "content_clean"))
