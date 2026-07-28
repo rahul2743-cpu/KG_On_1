@@ -1,0 +1,110 @@
+# ==========================================================
+# Cell 3 : Read Evaluation Dataset  →  Seed Document Set
+# ==========================================================
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# ----------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------
+
+RAG_EVAL_TABLE = "knwbt_airr_foundry_dev_catalog.secured.rag_eval_set"
+
+# Number of XML DOCUMENTS to load
+#   50 -> smoke | 200 -> ontology | 2000 -> real graph | None -> all
+TOP_K_XML = 50
+
+# ----------------------------------------------------------
+# Read Evaluation Dataset
+# ----------------------------------------------------------
+
+rag_eval_df = spark.table(RAG_EVAL_TABLE).cache()
+
+total_questions = rag_eval_df.count()
+
+print("=" * 80)
+print("RAG EVALUATION DATASET")
+print("=" * 80)
+
+print(f"Total Questions : {total_questions:,}")
+
+# ----------------------------------------------------------
+# Unique XML Documents  (dedupe FIRST, then limit)
+# ----------------------------------------------------------
+
+all_docs = (
+
+    rag_eval_df
+
+    .select(
+
+        "source",
+        "source_doc_title",
+        "source_doc_ref",
+        "retrieved_context"
+
+    )
+
+    .dropDuplicates(["source"])
+
+    .orderBy("source")
+
+)
+
+total_unique_docs = all_docs.count()
+
+# ----------------------------------------------------------
+# Assign doc_id  ( 1, 2, 3, ... )
+# ----------------------------------------------------------
+
+doc_window = Window.orderBy("source")
+
+all_docs = (
+
+    all_docs
+
+    .withColumn("doc_id", F.row_number().over(doc_window))
+
+    .select(
+
+        "doc_id",
+        "source",
+        "source_doc_title",
+        "source_doc_ref",
+        "retrieved_context"
+
+    )
+
+)
+
+# ----------------------------------------------------------
+# Apply Document Limit
+# ----------------------------------------------------------
+
+seed_docs = (
+
+    all_docs.filter(F.col("doc_id") <= TOP_K_XML)
+    if TOP_K_XML
+    else all_docs
+
+).cache()
+
+n_docs = seed_docs.count()
+
+# ----------------------------------------------------------
+# Summary
+# ----------------------------------------------------------
+
+print()
+
+print("=" * 80)
+print("SEED XML DOCUMENTS")
+print("=" * 80)
+
+print(f"Unique XML Docs Available : {total_unique_docs:,}")
+print(f"XML Docs Selected         : {n_docs:,}")
+
+print()
+
+display(seed_docs)
