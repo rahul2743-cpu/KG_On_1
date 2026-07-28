@@ -1,9 +1,8 @@
 # ==========================================================
-# Cell 3 : Read Evaluation Dataset  →  Seed Document Set
+# Cell 3 : Read Evaluation Dataset 
 # ==========================================================
 
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
 # ----------------------------------------------------------
 # Configuration
@@ -11,72 +10,90 @@ from pyspark.sql.window import Window
 
 RAG_EVAL_TABLE = "knwbt_airr_foundry_dev_catalog.secured.rag_eval_set"
 
-# Number of XML DOCUMENTS to load (not questions)
 TOP_K_XML = 50
-
-# Output Delta table for the seed document set
-SEED_DOCS_TABLE = "knwbt_airr_foundry_dev_catalog.secured.kg_seed_docs"
 
 # ----------------------------------------------------------
 # Read Evaluation Dataset
 # ----------------------------------------------------------
 
-rag_eval_df = spark.table(RAG_EVAL_TABLE).cache()
+rag_eval_df = (
+
+    spark.table(RAG_EVAL_TABLE)
+
+)
 
 print("=" * 80)
 print("RAG EVALUATION DATASET")
 print("=" * 80)
+
 print(f"Total Questions : {rag_eval_df.count()}")
 
 # ----------------------------------------------------------
-# Unique XML Documents — dedupe FIRST, then assign doc_id, then limit
+# Select Required Columns
 # ----------------------------------------------------------
 
-all_docs = (
+rag_eval_df = (
 
     rag_eval_df
 
     .select(
-        "source",
-        "source_doc_title",
+
+        "doc_id",
+        "request",
+        "question_type",
+        "difficulty",
+        "ground_truth",
         "source_doc_ref",
+        "source_doc_title",
+        "source",
+        "expected_facts",
         "retrieved_context"
+
     )
-
-    .dropDuplicates(["source"])
-
-    .orderBy("source")
 
 )
 
-doc_window = Window.orderBy("source")
+# ----------------------------------------------------------
+# Unique XML Documents FIRST  (keep title + ref + context together with source)
+# ----------------------------------------------------------
 
-all_docs = (
+unique_docs = (
 
-    all_docs
+    rag_eval_df
 
-    .withColumn("doc_id", F.row_number().over(doc_window))
+    .dropDuplicates(["source"])
 
-    .select(
-        "doc_id",
-        "source",
-        "source_doc_title",
-        "source_doc_ref",
-        "retrieved_context"
-    )
+    .orderBy("doc_id")
+
+)
+
+# ----------------------------------------------------------
+# Take Top 50 XML Sources
+# ----------------------------------------------------------
+
+top50_sources_full = (
+
+    unique_docs
+
+    .limit(TOP_K_XML)
 
 )
 
 top50_sources = (
 
-    all_docs.filter(F.col("doc_id") <= TOP_K_XML)
-    if TOP_K_XML
-    else all_docs
+    top50_sources_full
 
-).cache()
+    .select(
+        "source",
+        "source_doc_title",
+        "source_doc_ref",
+        "retrieved_context"
+    )
+
+)
 
 # ----------------------------------------------------------
-# Questions Belonging to the Selected Documents
+# Questions Belonging to the Selected 50 Documents
 # ----------------------------------------------------------
 
 top50_eval = (
@@ -84,40 +101,30 @@ top50_eval = (
     rag_eval_df
 
     .join(
-        top50_sources.select("source"),
+
+        top50_sources_full.select("source"),
         on  = "source",
         how = "inner"
+
     )
 
-).cache()
-
-# ----------------------------------------------------------
-# Write Seed Docs as a Delta Table
-# ----------------------------------------------------------
-
-(
-    top50_sources
-    .write
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(SEED_DOCS_TABLE)
 )
 
-# ----------------------------------------------------------
-# Summary
-# ----------------------------------------------------------
-
 print()
+
 print("=" * 80)
 print("TOP XML SOURCES")
 print("=" * 80)
 
 print(f"Questions Selected : {top50_eval.count()}")
+
 print(f"Unique XML Sources : {top50_sources.count()}")
-print(f"Table Created      : {SEED_DOCS_TABLE}")
 
 print()
+
+display(top50_eval)
+
+print()
+
 display(top50_sources)
 
-print()
-display(top50_eval)
