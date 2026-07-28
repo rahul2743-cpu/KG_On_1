@@ -1,0 +1,121 @@
+# ==========================================================
+# Cell 4 : Extract Matching XML Documents
+# ==========================================================
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# ----------------------------------------------------------
+# Read Raw XML Table
+# ----------------------------------------------------------
+
+RAW_TABLE = "knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data"
+
+raw_df = spark.table(RAW_TABLE)
+
+print("=" * 80)
+print("KNOWBOT RAW DATA")
+print("=" * 80)
+
+print(f"Total XML Documents : {raw_df.count()}")
+
+# ----------------------------------------------------------
+# Match XML Paths  (rename eval's source to avoid ambiguity)
+# ----------------------------------------------------------
+
+matched_xml = (
+
+    raw_df.alias("raw")
+
+    .join(
+
+        top50_sources.select(
+            F.col("source").alias("eval_source"),
+            "doc_id"
+        ).alias("eval"),
+
+        F.col("raw.source") == F.col("eval.eval_source"),
+
+        "inner"
+
+    )
+
+)
+
+# ----------------------------------------------------------
+# Keep Only the LATEST Version per doc_id
+# (raw table stores full version history — plain dropDuplicates
+#  picks an arbitrary row, not the latest, and can silently
+#  under-count when versions tie or ordering shifts)
+# ----------------------------------------------------------
+
+version_window = Window.partitionBy("doc_id").orderBy(
+    F.col("content_update_date").desc()
+)
+
+matched_xml = (
+
+    matched_xml
+
+    .withColumn("rn", F.row_number().over(version_window))
+
+    .filter(F.col("rn") == 1)
+
+    .drop("rn")
+
+)
+
+# ----------------------------------------------------------
+# Select Required Columns
+# ----------------------------------------------------------
+
+matched_xml = (
+
+    matched_xml
+
+    .select(
+
+        "doc_id",
+        "title",
+        "content",
+        "reference",
+        F.col("raw.source").alias("source"),
+        "version",
+        "content_update_date",
+        "content_author"
+
+    )
+
+).cache()
+
+n_matched = matched_xml.count()
+
+# ----------------------------------------------------------
+# Diagnostics — where did documents get lost?
+# ----------------------------------------------------------
+
+n_seed = top50_sources.count()
+
+print()
+print("=" * 80)
+print("MATCHED XML DOCUMENTS")
+print("=" * 80)
+
+print(f"Seed documents (cell 3)  : {n_seed}")
+print(f"Matched XML documents    : {n_matched}")
+
+if n_matched < n_seed:
+    missing = (
+        top50_sources
+        .select(F.col("source").alias("eval_source"), "doc_id")
+        .join(
+            matched_xml.select("doc_id"),
+            on="doc_id",
+            how="left_anti"
+        )
+    )
+    print(f"⚠️  {n_seed - n_matched} seed doc(s) NOT found in {RAW_TABLE}:")
+    display(missing)
+
+print()
+display(matched_xml)
