@@ -11,9 +11,11 @@ from pyspark.sql.window import Window
 
 RAG_EVAL_TABLE = "knwbt_airr_foundry_dev_catalog.secured.rag_eval_set"
 
-# Number of XML DOCUMENTS to load
-#   50 -> smoke | 200 -> ontology | 2000 -> real graph | None -> all
+# Number of XML DOCUMENTS to load (not questions)
 TOP_K_XML = 50
+
+# Output Delta table for the seed document set
+SEED_DOCS_TABLE = "knwbt_airr_foundry_dev_catalog.secured.kg_seed_docs"
 
 # ----------------------------------------------------------
 # Read Evaluation Dataset
@@ -21,16 +23,13 @@ TOP_K_XML = 50
 
 rag_eval_df = spark.table(RAG_EVAL_TABLE).cache()
 
-total_questions = rag_eval_df.count()
-
 print("=" * 80)
 print("RAG EVALUATION DATASET")
 print("=" * 80)
-
-print(f"Total Questions : {total_questions:,}")
+print(f"Total Questions : {rag_eval_df.count()}")
 
 # ----------------------------------------------------------
-# Unique XML Documents  (dedupe FIRST, then limit)
+# Unique XML Documents — dedupe FIRST, then assign doc_id, then limit
 # ----------------------------------------------------------
 
 all_docs = (
@@ -38,12 +37,10 @@ all_docs = (
     rag_eval_df
 
     .select(
-
         "source",
         "source_doc_title",
         "source_doc_ref",
         "retrieved_context"
-
     )
 
     .dropDuplicates(["source"])
@@ -51,12 +48,6 @@ all_docs = (
     .orderBy("source")
 
 )
-
-total_unique_docs = all_docs.count()
-
-# ----------------------------------------------------------
-# Assign doc_id  ( 1, 2, 3, ... )
-# ----------------------------------------------------------
 
 doc_window = Window.orderBy("source")
 
@@ -67,22 +58,16 @@ all_docs = (
     .withColumn("doc_id", F.row_number().over(doc_window))
 
     .select(
-
         "doc_id",
         "source",
         "source_doc_title",
         "source_doc_ref",
         "retrieved_context"
-
     )
 
 )
 
-# ----------------------------------------------------------
-# Apply Document Limit
-# ----------------------------------------------------------
-
-seed_docs = (
+top50_sources = (
 
     all_docs.filter(F.col("doc_id") <= TOP_K_XML)
     if TOP_K_XML
@@ -90,21 +75,49 @@ seed_docs = (
 
 ).cache()
 
-n_docs = seed_docs.count()
+# ----------------------------------------------------------
+# Questions Belonging to the Selected Documents
+# ----------------------------------------------------------
+
+top50_eval = (
+
+    rag_eval_df
+
+    .join(
+        top50_sources.select("source"),
+        on  = "source",
+        how = "inner"
+    )
+
+).cache()
+
+# ----------------------------------------------------------
+# Write Seed Docs as a Delta Table
+# ----------------------------------------------------------
+
+(
+    top50_sources
+    .write
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(SEED_DOCS_TABLE)
+)
 
 # ----------------------------------------------------------
 # Summary
 # ----------------------------------------------------------
 
 print()
-
 print("=" * 80)
-print("SEED XML DOCUMENTS")
+print("TOP XML SOURCES")
 print("=" * 80)
 
-print(f"Unique XML Docs Available : {total_unique_docs:,}")
-print(f"XML Docs Selected         : {n_docs:,}")
+print(f"Questions Selected : {top50_eval.count()}")
+print(f"Unique XML Sources : {top50_sources.count()}")
+print(f"Table Created      : {SEED_DOCS_TABLE}")
 
 print()
+display(top50_sources)
 
-display(seed_docs)
+print()
+display(top50_eval)
