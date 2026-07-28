@@ -86,10 +86,38 @@ matched_xml = (
 
 ).cache()
 
+# ----------------------------------------------------------
+# Add a Clean Sequential Index for Display : 0, 1, 2, 3 ...
+# (original doc_id is kept too — it's the real key, needed later
+#  to rejoin knowbot_raw_data or trace a graph node back to source)
+# ----------------------------------------------------------
+
+seq_window = Window.orderBy("doc_id")
+
+matched_xml = (
+
+    matched_xml
+
+    .withColumn("seq_id", F.row_number().over(seq_window) - 1)
+
+    .select(
+        "seq_id",
+        "doc_id",
+        "title",
+        "content",
+        "reference",
+        "source",
+        "version",
+        "content_update_date",
+        "content_author"
+    )
+
+).cache()
+
 n_matched = matched_xml.count()
 
 # ----------------------------------------------------------
-# Diagnostics
+# Diagnostics — where did documents get lost?
 # ----------------------------------------------------------
 
 n_seed = top50_sources.count()
