@@ -1,0 +1,98 @@
+# ==========================================================
+# Stage 4 : Knowledge Node Creation
+# Cell 6 : Create One Node per XML  (deterministic + normalized)
+# ==========================================================
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+
+print("=" * 80)
+print("KNOWLEDGE NODE CREATION")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# Input from Cell 5 (xml_df: doc_id, title, content_raw,
+# content_clean, reference, source)
+# ----------------------------------------------------------
+node_df = xml_df
+print(f"XML Documents (clean) : {node_df.count()}")
+
+# ----------------------------------------------------------
+# Reference normalization
+# MUST be identical to the normalization used in Cell 7
+# (hyperlink extraction). If these diverge -> orphan edges.
+# ----------------------------------------------------------
+def normalize_ref_col(c):
+    c = F.trim(c)
+    c = F.regexp_replace(c, r"^xwiki:", "")   # strip leading "xwiki:" if present
+    c = F.regexp_replace(c, r"\s+", "")        # collapse internal whitespace
+    return c
+
+# ----------------------------------------------------------
+# Build node projection — requested column set/order
+# node_content = CLEAN text (readable, [<doc:Ref>] chips intact)
+# node_content_raw kept alongside for provenance / debugging
+# ----------------------------------------------------------
+base = (
+    node_df
+    .select(
+        F.col("doc_id"),
+        F.col("source"),
+        F.col("reference").alias("node_id"),
+        F.col("title").alias("node_name"),
+        F.col("content_clean").alias("node_content"),
+        F.col("content_raw").alias("node_content_raw"),
+    )
+    .withColumn("node_id", normalize_ref_col(F.col("node_id")))
+    .withColumn(
+        "content_len",
+        F.length(F.coalesce(F.col("node_content"), F.lit("")))
+    )
+)
+
+# ----------------------------------------------------------
+# Deterministic dedup:
+# per node_id keep the row with the most content.
+# Tie-break on doc_id ascending — fully deterministic.
+# ----------------------------------------------------------
+w = (
+    Window
+    .partitionBy("node_id")
+    .orderBy(
+        F.col("content_len").desc_nulls_last(),
+        F.col("doc_id").asc(),
+    )
+)
+
+knowledge_nodes = (
+    base
+    .withColumn("_rk", F.row_number().over(w))
+    .filter(F.col("_rk") == 1)
+    .drop("_rk")
+    .withColumn("has_content", F.col("content_len") > 0)
+).cache()
+
+# ----------------------------------------------------------
+# Node Statistics
+# ----------------------------------------------------------
+total_nodes    = knowledge_nodes.count()
+n_with_content = knowledge_nodes.filter(F.col("has_content")).count()
+n_stub         = total_nodes - n_with_content
+
+# Diagnostic: did any distinct doc_ids collapse onto the same node_id?
+n_before_dedup = base.count()
+n_collisions   = n_before_dedup - total_nodes
+
+print()
+print("=" * 80)
+print("KNOWLEDGE NODES")
+print("=" * 80)
+print(f"Total Nodes Created  : {total_nodes}")
+print(f"With Content         : {n_with_content}")
+print(f"Stub / Empty         : {n_stub}")
+if n_collisions > 0:
+    print(f"⚠️  {n_collisions} doc(s) collapsed due to duplicate node_id (reference)")
+
+print()
+display(knowledge_nodes.select(
+    "doc_id", "source", "node_id", "node_name", "node_content"
+))
