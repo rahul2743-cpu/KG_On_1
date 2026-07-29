@@ -2,8 +2,15 @@
 # Stage 7 : Ontology Definition
 # Cell 9 : Corpus Profiling  →  Evidence for Entity/Relation Types
 # Fully generic — no hardcoded domain/category names.
+#
+# NOTE: knowbot_raw_data has NO tags column (confirmed via
+# printSchema — only doc_id/content/source/title/reference/
+# version/content_update_date/content_author/update exist).
+# Tags live in the ORIGINAL XML files, so this cell reads tags
+# directly from the source path instead.
 # ==========================================================
 from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StringType
 from collections import Counter
 import re
 
@@ -13,21 +20,34 @@ print("=" * 80)
 print(f"Documents in scope : {knowledge_nodes.count()}")
 
 # ----------------------------------------------------------
-# 1. TAG FREQUENCY
-#    (?s) = inline DOTALL — needed because <className> and <value>
-#    sit on different lines in your real XML; without it "." never
-#    crosses a newline and the regex silently matches nothing.
-#    Called as a NATIVE column function — NOT F.expr("...") — since
-#    F.expr() re-escapes backslashes in the SQL string layer and
-#    corrupts "\." before the regex engine ever sees it (same bug
-#    we hit and fixed in Cell 7).
+# 1. TAG FREQUENCY — read directly from source XML files
+#    (?s) = inline DOTALL, since <className> and <value> sit on
+#    different lines in the raw XML.
 # ----------------------------------------------------------
-TAG_PATTERN = r"(?s)<className>XWiki\.TagClass</className>.*?<value>(.*?)</value>"
+TAG_PATTERN = re.compile(r"(?s)<className>XWiki\.TagClass</className>.*?<value>(.*?)</value>")
+
+def extract_tags_from_file(path):
+    if not path:
+        return []
+    try:
+        # Databricks Volume/DBFS paths sometimes need the /dbfs prefix
+        # for plain Python file I/O (not needed for dbfs:/... via Spark,
+        # but IS needed for open() in a UDF running on the executor).
+        local_path = path
+        if local_path.startswith("dbfs:/"):
+            local_path = "/dbfs/" + local_path[len("dbfs:/"):]
+        with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        return TAG_PATTERN.findall(text)
+    except Exception:
+        return []   # unreadable file -> no tags, not a crash
+
+extract_tags_udf = F.udf(extract_tags_from_file, ArrayType(StringType()))
 
 tag_df = (
-    xml_df
-    .select("doc_id", "content_raw")
-    .withColumn("_tags", F.regexp_extract_all(F.col("content_raw"), F.lit(TAG_PATTERN), 1))
+    knowledge_nodes
+    .select("doc_id", "source")
+    .withColumn("_tags", extract_tags_udf(F.col("source")))
     .withColumn("tag", F.explode_outer("_tags"))
     .filter(F.col("tag").isNotNull() & (F.col("tag") != ""))
 )
@@ -49,7 +69,7 @@ print("─" * 80)
 display(tag_counts.limit(40))
 
 # ----------------------------------------------------------
-# 2. HUB DOCUMENTS  (unchanged — this already worked correctly)
+# 2. HUB DOCUMENTS — unchanged, already confirmed working (30 real rows)
 # ----------------------------------------------------------
 hub_docs = (
     hyperlinks_df
@@ -65,10 +85,7 @@ print("─" * 80)
 display(hub_docs.limit(30))
 
 # ----------------------------------------------------------
-# 3. NOUN-PHRASE FREQUENCY
-#    Network-restricted workspaces can't reach spaCy's model
-#    download host — this step degrades gracefully instead of
-#    crashing the cell, and suppresses the noisy SSL traceback.
+# 3. NOUN-PHRASE FREQUENCY — degrades gracefully if network-blocked
 # ----------------------------------------------------------
 try:
     import spacy
@@ -123,5 +140,3 @@ print("=" * 80)
 print("Review the lists above. Group repeated tags / hub titles / noun")
 print("phrases into a small number of entity categories (Cell 10). Categories")
 print("should be NAMED from what appears here — not assumed in advance.")
-
-spark.table("knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data").printSchema()
