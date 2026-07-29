@@ -1,0 +1,81 @@
+# ==========================================================
+# Stage 5 : Hyperlink Extraction
+# Cell 7 : Extract Hyperlinks per Source XML  (native, no UDF — 20k-safe)
+# Exactly two link types per your format:
+#   doc:Temp_Import       -> [Label <doc:Ref>] / [<doc:Ref>]
+#   doc:wiki:Temp_Import  -> [Label <doc:wiki:Ref>] / [<doc:wiki:Ref>]
+# ==========================================================
+from pyspark.sql import functions as F
+
+print("=" * 80)
+print("HYPERLINK EXTRACTION")
+print("=" * 80)
+
+# Regex patterns — pure Spark SQL string functions, no Python UDF
+FULL_MATCH = r"\[(?:[^<>\[\]]+?\s+)?<doc:(?:wiki:)?[^>]+>\]"
+LABEL      = r"^\[(?:([^<>\[\]]+?)\s+)?<doc:"
+WIKI_FLAG  = r"<doc:(wiki:)"
+REF        = r"<doc:(?:wiki:)?([^>]+)>"
+
+hyperlinks_df = (
+    knowledge_nodes
+    .select(
+        F.col("source"),
+        F.col("node_id").alias("source_node"),
+        F.col("node_name").alias("source_title"),
+        F.col("node_content"),
+    )
+    # regexp_extract_all -> array of every full [<doc:...>] chip in the content
+    .withColumn("_matches", F.expr(f"regexp_extract_all(node_content, '{FULL_MATCH}', 0)"))
+    .withColumn("_link", F.explode_outer("_matches"))
+    .filter(F.col("_link").isNotNull())
+    .withColumn("display_text", F.regexp_extract(F.col("_link"), LABEL, 1))
+    .withColumn(
+        "link_type",
+        F.when(F.regexp_extract(F.col("_link"), WIKI_FLAG, 1) != "", F.lit("doc:wiki"))
+         .otherwise(F.lit("doc:Temp_Import"))
+    )
+    .withColumn("target_reference", F.regexp_extract(F.col("_link"), REF, 1))
+    .select("source", "source_node", "source_title", "display_text", "target_reference", "link_type")
+).cache()
+
+# ----------------------------------------------------------
+# Grouped summary : per source XML path
+# ----------------------------------------------------------
+per_source_summary = (
+    hyperlinks_df
+    .groupBy("source", "source_title")
+    .agg(
+        F.count("*").alias("hyperlink_total"),
+        F.sum(F.when(F.col("link_type") == "doc:Temp_Import", 1).otherwise(0)).alias("doc_Temp_Import_total"),
+        F.sum(F.when(F.col("link_type") == "doc:wiki", 1).otherwise(0)).alias("doc_wiki_total"),
+        F.collect_list(F.struct("target_reference", "display_text", "link_type")).alias("all_hyperlinks"),
+    )
+    .orderBy("source")
+).cache()
+
+# ----------------------------------------------------------
+# Overall totals
+# ----------------------------------------------------------
+total_links  = hyperlinks_df.count()
+total_docimp = hyperlinks_df.filter(F.col("link_type") == "doc:Temp_Import").count()
+total_wiki   = hyperlinks_df.filter(F.col("link_type") == "doc:wiki").count()
+
+print()
+print("=" * 80)
+print("HYPERLINK SUMMARY")
+print("=" * 80)
+print(f"Knowledge Nodes       : {knowledge_nodes.count()}")
+print(f"Hyperlink Total       : {total_links}")
+print(f"doc:Temp_Import Total : {total_docimp}")
+print(f"doc:wiki Total        : {total_wiki}")
+
+print()
+print("Per-source breakdown:")
+display(per_source_summary.select(
+    "source", "source_title", "hyperlink_total", "doc_Temp_Import_total", "doc_wiki_total"
+))
+
+print()
+print("All hyperlinks (flat, per source):")
+display(hyperlinks_df.select("source", "source_title", "target_reference", "display_text", "link_type"))
