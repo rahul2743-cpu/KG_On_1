@@ -1,7 +1,7 @@
 # ==========================================================
 # Stage 6 : Title Resolution
 # Cell 8 : Replace <doc:Ref> / <doc:wiki:Ref> with Target Title
-#          (lookup built from FULL raw corpus, not just loaded slice)
+#          (shared-cluster safe — no sparkContext.broadcast)
 # ==========================================================
 from pyspark.sql import functions as F
 from pyspark.sql import Window
@@ -14,9 +14,6 @@ print("=" * 80)
 
 # ----------------------------------------------------------
 # 1. Build the title lookup from the FULL raw corpus
-#    (knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data),
-#    not just the currently loaded slice — this is the key upgrade.
-#    Same reference-normalization + latest-version logic as Cell 4.
 # ----------------------------------------------------------
 RAW_TABLE = "knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data"
 full_raw_df = spark.table(RAW_TABLE)
@@ -36,25 +33,24 @@ full_title_lookup_df = (
     )
 )
 
+# Collect to driver as a plain dict — NOT spark.sparkContext.broadcast().
+# On shared/UC-enabled clusters, sparkContext is off-limits. A plain
+# closure dict is auto-pickled per-task by Spark; at ~20k short string
+# pairs (a few MB) this is still cheap and works on every cluster mode.
 title_lookup_rows = full_title_lookup_df.collect()
 title_lookup_map  = {row["node_id"]: row["node_name"] for row in title_lookup_rows}
-title_lookup_bc   = spark.sparkContext.broadcast(title_lookup_map)
 
 print(f"Title lookup built : {len(title_lookup_map):,} documents (full corpus)")
 
 # ----------------------------------------------------------
-# 2. UDF: replace every [Label <doc:Ref>] / [<doc:Ref>] chip
-#    with [Target Title]. Since the lookup now spans the FULL
-#    corpus, almost every reference should resolve — a chip
-#    only stays raw if the reference is genuinely broken/missing
-#    upstream, not merely "outside our current slice".
+# 2. UDF: replace every chip with [Target Title], else leave as-is
+#    title_lookup_map is captured directly as a closure variable.
 # ----------------------------------------------------------
 CHIP_RE = re.compile(r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?:wiki:)?(?P<ref>[^>]+)>\]")
 
-def resolve_titles(content):
+def resolve_titles(content, lookup=title_lookup_map):
     if not content:
         return content, 0, 0
-    lookup = title_lookup_bc.value
     resolved_count, unresolved_count = 0, 0
 
     def _sub(m):
@@ -78,7 +74,7 @@ RESULT_SCHEMA = StructType([
 resolve_titles_udf = F.udf(resolve_titles, RESULT_SCHEMA)
 
 # ----------------------------------------------------------
-# 3. Apply and expand result struct
+# 3. Apply
 # ----------------------------------------------------------
 titled_nodes = (
     knowledge_nodes
@@ -108,8 +104,20 @@ print(f"Unresolved (kept raw): {total_unresolved}")
 if total_refs:
     print(f"Resolution Rate       : {100*total_resolved/total_refs:.1f}%")
 
+# ----------------------------------------------------------
+# Output Table : doc_id, source, title, new_content, reference
+# ----------------------------------------------------------
+final_table = (
+    titled_nodes
+    .select(
+        "doc_id",
+        "source",
+        F.col("node_name").alias("title"),
+        F.col("final_content").alias("new_content"),
+        F.col("node_id").alias("reference"),
+    )
+)
+
 print()
-display(titled_nodes.select(
-    "doc_id", "source", "node_id", "node_name",
-    "final_content", "resolved_titles", "unresolved_titles"
-))
+print("Final clean, readable content:")
+display(final_table)
