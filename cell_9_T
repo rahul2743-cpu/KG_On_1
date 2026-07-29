@@ -123,3 +123,5 @@ print("=" * 80)
 print("Review the lists above. Group repeated tags / hub titles / noun")
 print("phrases into a small number of entity categories (Cell 10). Categories")
 print("should be NAMED from what appears here — not assumed in advance.")
+
+spark.table("knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data").printSchema()
