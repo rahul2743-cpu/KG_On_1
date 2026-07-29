@@ -1,9 +1,6 @@
 # ==========================================================
 # Stage 5 : Hyperlink Extraction
 # Cell 7 : Extract Hyperlinks per Source XML  (native, no UDF — 20k-safe)
-# Exactly two link types per your format:
-#   doc:Temp_Import       -> [Label <doc:Ref>] / [<doc:Ref>]
-#   doc:wiki:Temp_Import  -> [Label <doc:wiki:Ref>] / [<doc:wiki:Ref>]
 # ==========================================================
 from pyspark.sql import functions as F
 
@@ -11,7 +8,6 @@ print("=" * 80)
 print("HYPERLINK EXTRACTION")
 print("=" * 80)
 
-# Regex patterns — pure Spark SQL string functions, no Python UDF
 FULL_MATCH = r"\[(?:[^<>\[\]]+?\s+)?<doc:(?:wiki:)?[^>]+>\]"
 LABEL      = r"^\[(?:([^<>\[\]]+?)\s+)?<doc:"
 WIKI_FLAG  = r"<doc:(wiki:)"
@@ -25,8 +21,8 @@ hyperlinks_df = (
         F.col("node_name").alias("source_title"),
         F.col("node_content"),
     )
-    # regexp_extract_all -> array of every full [<doc:...>] chip in the content
-    .withColumn("_matches", F.expr(f"regexp_extract_all(node_content, '{FULL_MATCH}', 0)"))
+    # Call as a native column function directly — NOT via F.expr("...")
+    .withColumn("_matches", F.regexp_extract_all(F.col("node_content"), F.lit(FULL_MATCH), 0))
     .withColumn("_link", F.explode_outer("_matches"))
     .filter(F.col("_link").isNotNull())
     .withColumn("display_text", F.regexp_extract(F.col("_link"), LABEL, 1))
