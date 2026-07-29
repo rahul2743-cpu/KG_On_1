@@ -1,0 +1,115 @@
+# ==========================================================
+# Stage 6 : Title Resolution
+# Cell 8 : Replace <doc:Ref> / <doc:wiki:Ref> with Target Title
+#          (lookup built from FULL raw corpus, not just loaded slice)
+# ==========================================================
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+from pyspark.sql.types import StringType, StructType, StructField, LongType
+import re
+
+print("=" * 80)
+print("TITLE RESOLUTION")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# 1. Build the title lookup from the FULL raw corpus
+#    (knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data),
+#    not just the currently loaded slice — this is the key upgrade.
+#    Same reference-normalization + latest-version logic as Cell 4.
+# ----------------------------------------------------------
+RAW_TABLE = "knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data"
+full_raw_df = spark.table(RAW_TABLE)
+
+version_window = Window.partitionBy("reference").orderBy(F.col("content_update_date").desc())
+
+full_title_lookup_df = (
+    full_raw_df
+    .select("reference", "title", "content_update_date")
+    .withColumn("_rn", F.row_number().over(version_window))
+    .filter(F.col("_rn") == 1)
+    .withColumn("reference_norm", F.regexp_replace(F.trim(F.col("reference")), r"^xwiki:", ""))
+    .withColumn("reference_norm", F.regexp_replace(F.col("reference_norm"), r"\s+", ""))
+    .select(
+        F.col("reference_norm").alias("node_id"),
+        F.trim(F.col("title")).alias("node_name"),
+    )
+)
+
+title_lookup_rows = full_title_lookup_df.collect()
+title_lookup_map  = {row["node_id"]: row["node_name"] for row in title_lookup_rows}
+title_lookup_bc   = spark.sparkContext.broadcast(title_lookup_map)
+
+print(f"Title lookup built : {len(title_lookup_map):,} documents (full corpus)")
+
+# ----------------------------------------------------------
+# 2. UDF: replace every [Label <doc:Ref>] / [<doc:Ref>] chip
+#    with [Target Title]. Since the lookup now spans the FULL
+#    corpus, almost every reference should resolve — a chip
+#    only stays raw if the reference is genuinely broken/missing
+#    upstream, not merely "outside our current slice".
+# ----------------------------------------------------------
+CHIP_RE = re.compile(r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?:wiki:)?(?P<ref>[^>]+)>\]")
+
+def resolve_titles(content):
+    if not content:
+        return content, 0, 0
+    lookup = title_lookup_bc.value
+    resolved_count, unresolved_count = 0, 0
+
+    def _sub(m):
+        nonlocal resolved_count, unresolved_count
+        ref = m.group("ref").strip()
+        title = lookup.get(ref)
+        if title:
+            resolved_count += 1
+            return f"[{title}]"
+        unresolved_count += 1
+        return m.group(0)
+
+    new_text = CHIP_RE.sub(_sub, content)
+    return new_text, resolved_count, unresolved_count
+
+RESULT_SCHEMA = StructType([
+    StructField("final_content",     StringType()),
+    StructField("resolved_titles",   LongType()),
+    StructField("unresolved_titles", LongType()),
+])
+resolve_titles_udf = F.udf(resolve_titles, RESULT_SCHEMA)
+
+# ----------------------------------------------------------
+# 3. Apply and expand result struct
+# ----------------------------------------------------------
+titled_nodes = (
+    knowledge_nodes
+    .withColumn("_result", resolve_titles_udf(F.col("node_content")))
+    .withColumn("final_content",     F.col("_result.final_content"))
+    .withColumn("resolved_titles",   F.col("_result.resolved_titles"))
+    .withColumn("unresolved_titles", F.col("_result.unresolved_titles"))
+    .drop("_result")
+).cache()
+
+# ----------------------------------------------------------
+# Summary
+# ----------------------------------------------------------
+total_docs       = titled_nodes.count()
+total_resolved   = titled_nodes.agg(F.sum("resolved_titles")).first()[0] or 0
+total_unresolved = titled_nodes.agg(F.sum("unresolved_titles")).first()[0] or 0
+total_refs       = total_resolved + total_unresolved
+
+print()
+print("=" * 80)
+print("TITLE RESOLUTION SUMMARY")
+print("=" * 80)
+print(f"Documents Processed  : {total_docs}")
+print(f"References Total     : {total_refs}")
+print(f"Resolved (title used): {total_resolved}")
+print(f"Unresolved (kept raw): {total_unresolved}")
+if total_refs:
+    print(f"Resolution Rate       : {100*total_resolved/total_refs:.1f}%")
+
+print()
+display(titled_nodes.select(
+    "doc_id", "source", "node_id", "node_name",
+    "final_content", "resolved_titles", "unresolved_titles"
+))
