@@ -1,0 +1,120 @@
+# ==========================================================
+# Stage 7 : Ontology Definition
+# Cell 9 : Corpus Profiling  →  Evidence for Entity/Relation Types
+# Fully generic — no hardcoded domain/category names.
+# Works for any 200–500 doc slice built by Cells 1–7.
+# ==========================================================
+from pyspark.sql import functions as F
+from collections import Counter
+import re
+
+print("=" * 80)
+print("CORPUS PROFILING")
+print("=" * 80)
+print(f"Documents in scope : {knowledge_nodes.count()}")
+
+# ----------------------------------------------------------
+# 1. TAG FREQUENCY
+#    Tags are XWiki.TagClass <value> entries inside content_raw.
+#    Extracted generically via regex — no assumption about
+#    which tags exist, just where tags live structurally.
+# ----------------------------------------------------------
+TAG_PATTERN = r"<className>XWiki\.TagClass</className>.*?<value>(.*?)</value>"
+
+tag_df = (
+    xml_df
+    .select("doc_id", "content_raw")
+    .withColumn("_tags", F.expr(
+        f"regexp_extract_all(content_raw, '{TAG_PATTERN}', 1)"
+    ))
+    .withColumn("tag", F.explode_outer("_tags"))
+    .filter(F.col("tag").isNotNull() & (F.col("tag") != ""))
+)
+
+tag_counts = (
+    tag_df
+    .groupBy("tag")
+    .count()
+    .orderBy(F.desc("count"))
+)
+
+n_tagged_docs = tag_df.select("doc_id").distinct().count()
+n_total_docs  = knowledge_nodes.count()
+
+print()
+print("─" * 80)
+print(f"TAGS  ({n_tagged_docs}/{n_total_docs} documents carry at least one tag)")
+print("─" * 80)
+display(tag_counts.limit(40))
+
+# ----------------------------------------------------------
+# 2. HUB DOCUMENTS
+#    Most-referenced targets from Cell 7's hyperlink extraction —
+#    pure graph statistics, nothing hardcoded.
+# ----------------------------------------------------------
+hub_docs = (
+    hyperlinks_df
+    .groupBy("target_reference")
+    .agg(F.count("*").alias("inbound_links"))
+    .orderBy(F.desc("inbound_links"))
+)
+
+print()
+print("─" * 80)
+print("HUB DOCUMENTS (most-referenced — likely core domain concepts)")
+print("─" * 80)
+display(hub_docs.limit(30))
+
+# ----------------------------------------------------------
+# 3. NOUN-PHRASE FREQUENCY
+#    Generic NLP statistics over node_content — no domain
+#    assumptions, just "what nouns/phrases recur across the corpus".
+#    Small model, noun_chunks only — fast enough for 200-500 docs.
+# ----------------------------------------------------------
+try:
+    import spacy
+    try:
+        nlp = spacy.load("en_core_web_sm", disable=["ner", "lemmatizer"])
+    except OSError:
+        import subprocess
+        subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=True)
+        nlp = spacy.load("en_core_web_sm", disable=["ner", "lemmatizer"])
+
+    texts = [
+        row["node_content"]
+        for row in knowledge_nodes.select("node_content").collect()
+        if row["node_content"]
+    ]
+
+    phrase_counts = Counter()
+    STOPISH = {"this", "that", "these", "those", "it", "which", "who", "what"}
+
+    for doc in nlp.pipe(texts, batch_size=32):
+        for chunk in doc.noun_chunks:
+            phrase = re.sub(r"\s+", " ", chunk.text.strip().lower())
+            if len(phrase) < 3 or phrase in STOPISH:
+                continue
+            phrase_counts[phrase] += 1
+
+    print()
+    print("─" * 80)
+    print("TOP RECURRING NOUN PHRASES (generic NLP, no domain assumptions)")
+    print("─" * 80)
+    for phrase, n in phrase_counts.most_common(50):
+        print(f"  {n:4d}  {phrase}")
+
+except Exception as e:
+    print()
+    print(f"⚠️  spaCy step skipped ({e}). Tags + hub documents above are still usable "
+          f"evidence on their own — this step just adds untagged vocabulary.")
+
+# ----------------------------------------------------------
+# Summary — what to do with this output
+# ----------------------------------------------------------
+print()
+print("=" * 80)
+print("NEXT STEP")
+print("=" * 80)
+print("Review the three lists above. Group repeated tags / hub titles / noun")
+print("phrases into a small number of entity categories (Cell 10). Categories")
+print("should be NAMED from what appears here — not assumed in advance.")
