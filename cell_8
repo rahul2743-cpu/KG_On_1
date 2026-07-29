@@ -1,7 +1,8 @@
 # ==========================================================
 # Stage 6 : Title Resolution
 # Cell 8 : Replace <doc:Ref> / <doc:wiki:Ref> with Target Title
-#          (shared-cluster safe — no sparkContext.broadcast)
+#          (matched against knowbot_raw_data.reference — plain
+#          Temp_Import form only, no "wiki:" stored there)
 # ==========================================================
 from pyspark.sql import functions as F
 from pyspark.sql import Window
@@ -13,7 +14,8 @@ print("TITLE RESOLUTION")
 print("=" * 80)
 
 # ----------------------------------------------------------
-# 1. Build the title lookup from the FULL raw corpus
+# 1. Build the title lookup from the FULL raw corpus.
+#    reference column is plain "Temp_Import...." — no "wiki:" prefix.
 # ----------------------------------------------------------
 RAW_TABLE = "knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data"
 full_raw_df = spark.table(RAW_TABLE)
@@ -25,7 +27,7 @@ full_title_lookup_df = (
     .select("reference", "title", "content_update_date")
     .withColumn("_rn", F.row_number().over(version_window))
     .filter(F.col("_rn") == 1)
-    .withColumn("reference_norm", F.regexp_replace(F.trim(F.col("reference")), r"^xwiki:", ""))
+    .withColumn("reference_norm", F.regexp_replace(F.trim(F.col("reference")), r"^(xwiki:|wiki:)", ""))
     .withColumn("reference_norm", F.regexp_replace(F.col("reference_norm"), r"\s+", ""))
     .select(
         F.col("reference_norm").alias("node_id"),
@@ -33,20 +35,29 @@ full_title_lookup_df = (
     )
 )
 
-# Collect to driver as a plain dict — NOT spark.sparkContext.broadcast().
-# On shared/UC-enabled clusters, sparkContext is off-limits. A plain
-# closure dict is auto-pickled per-task by Spark; at ~20k short string
-# pairs (a few MB) this is still cheap and works on every cluster mode.
 title_lookup_rows = full_title_lookup_df.collect()
 title_lookup_map  = {row["node_id"]: row["node_name"] for row in title_lookup_rows}
 
 print(f"Title lookup built : {len(title_lookup_map):,} documents (full corpus)")
 
 # ----------------------------------------------------------
-# 2. UDF: replace every chip with [Target Title], else leave as-is
-#    title_lookup_map is captured directly as a closure variable.
+# 2. UDF: replace every [Label <doc:Ref>] / [Label <doc:wiki:Ref>] chip
+#    with [Target Title].
+#
+#    Both doc:Ref and doc:wiki:Ref extract the SAME ref string (the
+#    regex captures everything after the optional "wiki:" already),
+#    so both link types are matched against the exact same lookup —
+#    no separate handling needed. If a doc:wiki:Ref genuinely has no
+#    match in knowbot_raw_data, it is left untouched, exactly like
+#    any other unresolved reference — no forced/fake substitution.
 # ----------------------------------------------------------
 CHIP_RE = re.compile(r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?:wiki:)?(?P<ref>[^>]+)>\]")
+
+def normalize_ref(ref: str) -> str:
+    ref = ref.strip()
+    ref = re.sub(r"^(xwiki:|wiki:)", "", ref)   # safety net, ref should already be clean
+    ref = re.sub(r"\s+", "", ref)
+    return ref
 
 def resolve_titles(content, lookup=title_lookup_map):
     if not content:
@@ -55,13 +66,13 @@ def resolve_titles(content, lookup=title_lookup_map):
 
     def _sub(m):
         nonlocal resolved_count, unresolved_count
-        ref = m.group("ref").strip()
+        ref = normalize_ref(m.group("ref"))
         title = lookup.get(ref)
         if title:
             resolved_count += 1
             return f"[{title}]"
         unresolved_count += 1
-        return m.group(0)
+        return m.group(0)  # leave as-is — no match in reference table
 
     new_text = CHIP_RE.sub(_sub, content)
     return new_text, resolved_count, unresolved_count
