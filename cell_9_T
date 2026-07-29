@@ -140,3 +140,23 @@ print("=" * 80)
 print("Review the lists above. Group repeated tags / hub titles / noun")
 print("phrases into a small number of entity categories (Cell 10). Categories")
 print("should be NAMED from what appears here — not assumed in advance.")
+
+
+
+
+
+
+
+----
+
+test_row = knowledge_nodes.select("source").limit(1).collect()[0]
+test_path = test_row["source"]
+print("source path:", test_path)
+
+try:
+    with open(test_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+    print(f"✅ Opened fine, {len(content)} chars read")
+    print("Contains 'TagClass'?", "TagClass" in content)
+except Exception as e:
+    print(f"❌ Failed: {e}")
