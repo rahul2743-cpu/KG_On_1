@@ -1,0 +1,104 @@
+# ==========================================================
+# Stage 7 : Ontology Definition
+# Cell 10 : Resolve Hub Titles + Finalize Ontology
+# ==========================================================
+from pyspark.sql import functions as F
+
+print("=" * 80)
+print("RESOLVING HUB DOCUMENT TITLES")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# Join hub_docs (raw UUID references) against the title lookup
+# so we can actually SEE what the top concepts are, not just IDs.
+# ----------------------------------------------------------
+hub_docs_titled = (
+    hub_docs
+    .join(
+        knowledge_nodes.select(
+            F.col("node_id").alias("target_reference"),
+            F.col("node_name").alias("target_title"),
+        ),
+        on="target_reference",
+        how="left",
+    )
+    .orderBy(F.desc("inbound_links"))
+)
+
+print("Top hub documents, with titles:")
+display(hub_docs_titled.limit(20))
+
+n_unresolved = hub_docs_titled.filter(F.col("target_title").isNull()).count()
+print(f"\n⚠️  {n_unresolved} of the top hub references have no title in the loaded "
+      f"50-doc slice (target document wasn't loaded — same known limitation as Cell 8).")
+
+# ==========================================================
+# ONTOLOGY DECISION
+# Grounded in the REAL tag list already pulled (21 tags, 30/50 docs)
+# and to be cross-checked against hub titles once resolved above.
+# ==========================================================
+
+ENTITY_TYPES = {
+    "TOPIC_DOMAIN": (
+        "A subject-matter/engineering domain area a document or entity belongs to. "
+        "Evidence (real tags): Engine Environmental Protection, Systems Engineering, "
+        "Oil-System Capability, Combustion, Civil Aerospace, Health Safety and Environment."
+    ),
+    "TOOL_SYSTEM": (
+        "A named tool, software system, or IT platform. "
+        "Evidence (real tags): eTestDiary, TEDS, ESE Tools, AI."
+    ),
+    "PROGRAMME_PROJECT": (
+        "A named programme, project, or codenamed initiative. "
+        "Evidence (real tags): Codenamed Programme, RRE/Old-RRE-DE-Wiki."
+    ),
+    "STANDARD_REGULATION": (
+        "A named certification requirement, standard, or regulatory reference. "
+        "Evidence (real tag): Certification; plus content evidence from earlier "
+        "samples: CS-E 740, FAR 33.88, EASA."
+    ),
+    "ANALYSIS_METHOD": (
+        "A named engineering method, model, or analysis technique. "
+        "Evidence (real tags, tentative): Genthermal, PerfToL — names suggest "
+        "thermal/performance modelling tools/methods; VERIFY against actual "
+        "document content once hub titles resolve."
+    ),
+    "TEST_PROCESS": (
+        "A named test, test process, or test campaign. "
+        "Evidence from prior content samples: Endurance Test, 150Hr Endurance Test, "
+        "Calibration Test, Blocking."
+    ),
+    "PRODUCT_PROGRAM": (
+        "A named engine/product programme. "
+        "Evidence from prior content samples: Trent, UltraFan, Power Gearbox."
+    ),
+    "ORGANIZATION_TEAM": (
+        "A named team, council, or organisational unit. "
+        "Evidence from prior content samples: Thermofluid Systems Global Capability Council."
+    ),
+}
+
+RELATION_TYPES = {
+    "BELONGS_TO_DOMAIN": "Document/entity is categorized under a topic domain (from tags).",
+    "USES_TOOL":          "A process or artefact uses a named tool/system.",
+    "PART_OF_PROGRAMME":  "An artefact/test belongs to a named programme/project.",
+    "GOVERNED_BY":        "An artefact/test is governed by a standard/regulation.",
+    "APPLIES_METHOD":     "An analysis method is applied to a product/component.",
+    "TESTED_BY":          "A product/component is validated by a named test process.",
+    "PART_OF_PRODUCT":    "A component is part of a larger product programme.",
+    "OWNED_BY":           "An artefact is owned/maintained by an organization/team.",
+}
+
+print()
+print("=" * 80)
+print("PROPOSED ONTOLOGY")
+print("=" * 80)
+print(f"Entity Types   : {len(ENTITY_TYPES)}")
+for k, v in ENTITY_TYPES.items():
+    print(f"\n  {k}")
+    print(f"    {v}")
+
+print()
+print(f"Relation Types : {len(RELATION_TYPES)}")
+for k, v in RELATION_TYPES.items():
+    print(f"  {k:20s} — {v}")
