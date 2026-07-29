@@ -9,29 +9,15 @@ print("=" * 80)
 print("KNOWLEDGE NODE CREATION")
 print("=" * 80)
 
-# ----------------------------------------------------------
-# Input from Cell 5 (xml_df: doc_id, title, content_raw,
-# content_clean, reference, source)
-# ----------------------------------------------------------
 node_df = xml_df
 print(f"XML Documents (clean) : {node_df.count()}")
 
-# ----------------------------------------------------------
-# Reference normalization
-# MUST be identical to the normalization used in Cell 7
-# (hyperlink extraction). If these diverge -> orphan edges.
-# ----------------------------------------------------------
 def normalize_ref_col(c):
     c = F.trim(c)
-    c = F.regexp_replace(c, r"^xwiki:", "")   # strip leading "xwiki:" if present
-    c = F.regexp_replace(c, r"\s+", "")        # collapse internal whitespace
+    c = F.regexp_replace(c, r"^xwiki:", "")
+    c = F.regexp_replace(c, r"\s+", "")
     return c
 
-# ----------------------------------------------------------
-# Build node projection — requested column set/order
-# node_content = CLEAN text (readable, [<doc:Ref>] chips intact)
-# node_content_raw kept alongside for provenance / debugging
-# ----------------------------------------------------------
 base = (
     node_df
     .select(
@@ -43,24 +29,12 @@ base = (
         F.col("content_raw").alias("node_content_raw"),
     )
     .withColumn("node_id", normalize_ref_col(F.col("node_id")))
-    .withColumn(
-        "content_len",
-        F.length(F.coalesce(F.col("node_content"), F.lit("")))
-    )
+    .withColumn("content_len", F.length(F.coalesce(F.col("node_content"), F.lit(""))))
 )
 
-# ----------------------------------------------------------
-# Deterministic dedup:
-# per node_id keep the row with the most content.
-# Tie-break on doc_id ascending — fully deterministic.
-# ----------------------------------------------------------
 w = (
-    Window
-    .partitionBy("node_id")
-    .orderBy(
-        F.col("content_len").desc_nulls_last(),
-        F.col("doc_id").asc(),
-    )
+    Window.partitionBy("node_id")
+    .orderBy(F.col("content_len").desc_nulls_last(), F.col("doc_id").asc())
 )
 
 knowledge_nodes = (
@@ -71,16 +45,10 @@ knowledge_nodes = (
     .withColumn("has_content", F.col("content_len") > 0)
 ).cache()
 
-# ----------------------------------------------------------
-# Node Statistics
-# ----------------------------------------------------------
 total_nodes    = knowledge_nodes.count()
 n_with_content = knowledge_nodes.filter(F.col("has_content")).count()
 n_stub         = total_nodes - n_with_content
-
-# Diagnostic: did any distinct doc_ids collapse onto the same node_id?
-n_before_dedup = base.count()
-n_collisions   = n_before_dedup - total_nodes
+n_collisions   = base.count() - total_nodes
 
 print()
 print("=" * 80)
@@ -92,7 +60,20 @@ print(f"Stub / Empty         : {n_stub}")
 if n_collisions > 0:
     print(f"⚠️  {n_collisions} doc(s) collapsed due to duplicate node_id (reference)")
 
+# ----------------------------------------------------------
+# Sanity check: node_content MUST equal xml_df's content_clean
+# for the same doc_id. If this ever prints a mismatch count > 0,
+# xml_df was stale when this cell ran — rerun cell 5 first.
+# ----------------------------------------------------------
+check = (
+    knowledge_nodes.alias("n")
+    .join(xml_df.select("doc_id", "content_clean").alias("x"), on="doc_id", how="inner")
+    .filter(F.col("n.node_content") != F.col("x.content_clean"))
+)
+n_mismatch = check.count()
+print(f"\n🔎 node_content vs content_clean mismatch count : {n_mismatch}")
+if n_mismatch > 0:
+    print("⚠️  MISMATCH DETECTED — rerun Cell 5 fully, then rerun Cell 6.")
+
 print()
-display(knowledge_nodes.select(
-    "doc_id", "source", "node_id", "node_name", "node_content"
-))
+display(knowledge_nodes.select("doc_id", "source", "node_id", "node_name", "node_content"))
