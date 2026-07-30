@@ -1,0 +1,125 @@
+# ==========================================================
+# Cell 13 : Extraction Prompt + GraphRAGExtractor
+# This is where your LLM actually gets called per document.
+# ==========================================================
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, LongType
+import json
+
+print("=" * 80)
+print("EXTRACTION PROMPT + EXTRACTOR")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# 1. Build the extraction prompt DYNAMICALLY from Cell 12's
+#    ontology — no hardcoded types, same pattern the reference
+#    notebook uses (their Cell 9/10).
+# ----------------------------------------------------------
+entity_types_str   = ", ".join(ENTITY_NAMES)
+relation_types_str = ", ".join(RELATION_NAMES)
+
+KG_EXTRACT_PROMPT = """-Goal-
+Given a Rolls-Royce engineering wiki document, identify all entities mentioned
+and their relationships.
+
+Extract up to {max_triplets} entity-relation triplets.
+
+-Allowed Entity Types-
+{entity_types}
+
+-Allowed Relationship Types-
+{relation_types}
+
+-Steps-
+1. Identify ALL entities. For each entity extract:
+   - name: Name of the entity, capitalized
+   - type: One of the allowed entity types above
+   - description: A brief description of the entity and its role in this document
+
+2. Identify relationships between entities. For each pair extract:
+   - source: name of the source entity
+   - target: name of the target entity
+   - relation: one of the allowed relationship types above
+   - description: a sentence explaining why/how these entities are related
+
+-Real Data-
+Document title: {title}
+######################
+{text}
+######################
+"""
+
+print("✅ Prompt template ready (uses ontology from Cell 12)")
+
+# ----------------------------------------------------------
+# 2. Structured LLM — forces output to match ExtractionResult
+#    (your `llm` is ChatOpenAI, which supports function-calling
+#    structured output via with_structured_output, same as
+#    Databricks/Anthropic clients)
+# ----------------------------------------------------------
+structured_llm = llm.with_structured_output(ExtractionResult)
+
+MAX_PATHS_PER_CHUNK = 20   # cap triplets per document, controls cost/quality tradeoff
+MAX_CONTENT_CHARS   = 6000 # cap input length per call
+
+# ----------------------------------------------------------
+# 3. The extractor function — ONE LLM call per document
+# ----------------------------------------------------------
+def extract_entities_relations(doc_id, title: str, content: str) -> dict:
+    """
+    Calls the LLM once for this document's content, constrained
+    to the ontology from Cell 12. Returns a plain dict (entities +
+    relationships), or an empty result on failure — never crashes
+    the caller.
+    """
+    if not content:
+        return {"doc_id": doc_id, "entities": [], "relationships": [], "error": None}
+
+    prompt = KG_EXTRACT_PROMPT.format(
+        max_triplets=MAX_PATHS_PER_CHUNK,
+        entity_types=entity_types_str,
+        relation_types=relation_types_str,
+        title=title or "",
+        text=content[:MAX_CONTENT_CHARS],
+    )
+
+    try:
+        result: ExtractionResult = structured_llm.invoke(prompt)
+        return {
+            "doc_id": doc_id,
+            "entities": [e.model_dump() for e in result.entities],
+            "relationships": [r.model_dump() for r in result.relationships],
+            "error": None,
+        }
+    except Exception as e:
+        return {"doc_id": doc_id, "entities": [], "relationships": [], "error": str(e)}
+
+
+print("✅ extract_entities_relations() ready — no calls made yet, this is just the function")
+
+# ----------------------------------------------------------
+# 4. Smoke test — ONE real call, on ONE document, to confirm
+#    the whole chain (prompt → LLM → Pydantic parsing) works
+#    before running it across the full corpus.
+# ----------------------------------------------------------
+test_row = knowledge_nodes.select("doc_id", "node_name", "node_content").limit(1).collect()[0]
+
+print(f"\nSmoke test on doc_id={test_row['doc_id']} ('{test_row['node_name']}')...")
+test_result = extract_entities_relations(
+    test_row["doc_id"], test_row["node_name"], test_row["node_content"]
+)
+
+if test_result["error"]:
+    print(f"❌ Extraction failed: {test_result['error']}")
+else:
+    print(f"✅ Extracted {len(test_result['entities'])} entities, "
+          f"{len(test_result['relationships'])} relationships")
+    print()
+    print("Entities:")
+    for e in test_result["entities"]:
+        print(f"  [{e['type']}] {e['name']} — {e['description']}")
+    print()
+    print("Relationships:")
+    for r in test_result["relationships"]:
+        print(f"  {r['source']} --{r['relation']}--> {r['target']}")
+        print(f"    {r['description']}")
