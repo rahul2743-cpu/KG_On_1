@@ -1,134 +1,136 @@
 # ==========================================================
-# Stage 6 : Title Resolution
-# Cell 8 : Replace <doc:Ref> / <doc:wiki:Ref> with Target Title
-#          (matched against knowbot_raw_data.reference — plain
-#          Temp_Import form only, no "wiki:" stored there)
+# Cell 8 : Ontology Discovery — LLM reads REAL document content
+# from Cell 6's `knowledge_nodes`. Fully generic — works whether
+# you loaded 50 or 500+ docs. Entity/relation categories emerge
+# from evidence across a sample; count is NOT preset.
 # ==========================================================
 from pyspark.sql import functions as F
-from pyspark.sql import Window
-from pyspark.sql.types import StringType, StructType, StructField, LongType
-import re
+import json
 
 print("=" * 80)
-print("TITLE RESOLUTION")
+print("CONTENT-BASED ONTOLOGY DISCOVERY")
 print("=" * 80)
 
-# ----------------------------------------------------------
-# 1. Build the title lookup from the FULL raw corpus.
-#    reference column is plain "Temp_Import...." — no "wiki:" prefix.
-# ----------------------------------------------------------
-RAW_TABLE = "knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data"
-full_raw_df = spark.table(RAW_TABLE)
+total_docs = knowledge_nodes.count()
+print(f"Total documents available : {total_docs}")
 
-version_window = Window.partitionBy("reference").orderBy(F.col("content_update_date").desc())
+# ----------------------------------------------------------
+# 1. Sample size scales with corpus size — enough to see real
+#    repetition, not so much that cost balloons at 100-500+ docs.
+#    Skip empty/stub documents (same fix as the doc_id=40 case).
+# ----------------------------------------------------------
+MIN_CONTENT_LENGTH = 200
+SAMPLE_SIZE = min(30, total_docs)   # cap at 30 regardless of corpus size — cheap, still solid evidence
 
-full_title_lookup_df = (
-    full_raw_df
-    .select("reference", "title", "content_update_date")
-    .withColumn("_rn", F.row_number().over(version_window))
-    .filter(F.col("_rn") == 1)
-    .withColumn("reference_norm", F.regexp_replace(F.trim(F.col("reference")), r"^(xwiki:|wiki:)", ""))
-    .withColumn("reference_norm", F.regexp_replace(F.col("reference_norm"), r"\s+", ""))
-    .select(
-        F.col("reference_norm").alias("node_id"),
-        F.trim(F.col("title")).alias("node_name"),
-    )
+eligible_docs = knowledge_nodes.filter(
+    F.length(F.coalesce(F.col("node_content"), F.lit(""))) >= MIN_CONTENT_LENGTH
 )
 
-title_lookup_rows = full_title_lookup_df.collect()
-title_lookup_map  = {row["node_id"]: row["node_name"] for row in title_lookup_rows}
+n_eligible = eligible_docs.count()
+print(f"Documents with real content (≥{MIN_CONTENT_LENGTH} chars) : {n_eligible}")
 
-print(f"Title lookup built : {len(title_lookup_map):,} documents (full corpus)")
+sample_docs = (
+    eligible_docs
+    .select("doc_id", "node_name", "node_content")
+    .orderBy(F.rand(seed=42))          # random across the WHOLE corpus, not first-N
+    .limit(SAMPLE_SIZE)
+    .collect()
+)
 
-# ----------------------------------------------------------
-# 2. UDF: replace every [Label <doc:Ref>] / [Label <doc:wiki:Ref>] chip
-#    with [Target Title].
-#
-#    Both doc:Ref and doc:wiki:Ref extract the SAME ref string (the
-#    regex captures everything after the optional "wiki:" already),
-#    so both link types are matched against the exact same lookup —
-#    no separate handling needed. If a doc:wiki:Ref genuinely has no
-#    match in knowbot_raw_data, it is left untouched, exactly like
-#    any other unresolved reference — no forced/fake substitution.
-# ----------------------------------------------------------
-CHIP_RE = re.compile(r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?:wiki:)?(?P<ref>[^>]+)>\]")
-
-def normalize_ref(ref: str) -> str:
-    ref = ref.strip()
-    ref = re.sub(r"^(xwiki:|wiki:)", "", ref)   # safety net, ref should already be clean
-    ref = re.sub(r"\s+", "", ref)
-    return ref
-
-def resolve_titles(content, lookup=title_lookup_map):
-    if not content:
-        return content, 0, 0
-    resolved_count, unresolved_count = 0, 0
-
-    def _sub(m):
-        nonlocal resolved_count, unresolved_count
-        ref = normalize_ref(m.group("ref"))
-        title = lookup.get(ref)
-        if title:
-            resolved_count += 1
-            return f"[{title}]"
-        unresolved_count += 1
-        return m.group(0)  # leave as-is — no match in reference table
-
-    new_text = CHIP_RE.sub(_sub, content)
-    return new_text, resolved_count, unresolved_count
-
-RESULT_SCHEMA = StructType([
-    StructField("final_content",     StringType()),
-    StructField("resolved_titles",   LongType()),
-    StructField("unresolved_titles", LongType()),
-])
-resolve_titles_udf = F.udf(resolve_titles, RESULT_SCHEMA)
+print(f"Sampling {len(sample_docs)} documents for ontology discovery\n")
 
 # ----------------------------------------------------------
-# 3. Apply
+# 2. Ask the LLM, per sampled document, what KINDS of entities
+#    and relationships actually appear — generic prompt, no
+#    domain assumptions baked in.
 # ----------------------------------------------------------
-titled_nodes = (
-    knowledge_nodes
-    .withColumn("_result", resolve_titles_udf(F.col("node_content")))
-    .withColumn("final_content",     F.col("_result.final_content"))
-    .withColumn("resolved_titles",   F.col("_result.resolved_titles"))
-    .withColumn("unresolved_titles", F.col("_result.unresolved_titles"))
-    .drop("_result")
-).cache()
+DISCOVERY_PROMPT = """Read this document. Identify:
+
+1. DISTINCT KINDS of named things it mentions (categories, not the
+   specific names) — e.g. "named product/component", "named test
+   procedure", "named standard/regulation".
+
+2. DISTINCT KINDS of relationships between those things, AS ACTUALLY
+   EXPRESSED in the text — e.g. "X is part of Y", "X is governed by Y",
+   "X identifies Y". Describe the relationship TYPE generically.
+
+Be specific to what THIS text actually contains. Do not guess
+categories that aren't evidenced here. Return at most 5 of each.
+
+Respond as JSON only, no other text:
+{{"entity_categories": ["...", "..."], "relation_categories": ["...", "..."]}}
+
+Document title: {title}
+Document text:
+{content}
+"""
+
+entity_votes = {}
+relation_votes = {}
+failures = 0
+
+for i, row in enumerate(sample_docs, 1):
+    prompt = DISCOVERY_PROMPT.format(
+        title=row["node_name"] or "",
+        content=(row["node_content"] or "")[:3000],
+    )
+    try:
+        response = llm.invoke([("human", prompt)])
+        text = response.content.strip().replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(text)
+
+        for cat in parsed.get("entity_categories", []):
+            key = cat.strip().lower()
+            if key:
+                entity_votes[key] = entity_votes.get(key, 0) + 1
+
+        for cat in parsed.get("relation_categories", []):
+            key = cat.strip().lower()
+            if key:
+                relation_votes[key] = relation_votes.get(key, 0) + 1
+
+    except Exception as e:
+        failures += 1
+        print(f"  [{i}/{len(sample_docs)}] ⚠️  Failed on '{row['node_name']}': {e}")
+
+n_ok = len(sample_docs) - failures
+print(f"\n{n_ok}/{len(sample_docs)} documents processed successfully")
+
+# ----------------------------------------------------------
+# 3. Report — categories multiple INDEPENDENT documents
+#    surfaced are the real signal. Threshold scales loosely
+#    with sample size (not hardcoded to one corpus size).
+# ----------------------------------------------------------
+REPEAT_THRESHOLD = max(2, round(n_ok * 0.15))   # e.g. ~15% of successful docs, min 2
+
+print()
+print("=" * 80)
+print(f"ENTITY CATEGORY VOTES  (repeat threshold: ≥{REPEAT_THRESHOLD} docs)")
+print("=" * 80)
+for cat, n in sorted(entity_votes.items(), key=lambda x: -x[1]):
+    flag = "✅ repeated" if n >= REPEAT_THRESHOLD else "⚠️  one-off"
+    print(f"  {n:2d}  {cat:50s} {flag}")
+
+print()
+print("=" * 80)
+print(f"RELATION CATEGORY VOTES  (repeat threshold: ≥{REPEAT_THRESHOLD} docs)")
+print("=" * 80)
+for cat, n in sorted(relation_votes.items(), key=lambda x: -x[1]):
+    flag = "✅ repeated" if n >= REPEAT_THRESHOLD else "⚠️  one-off"
+    print(f"  {n:2d}  {cat:50s} {flag}")
 
 # ----------------------------------------------------------
 # Summary
 # ----------------------------------------------------------
-total_docs       = titled_nodes.count()
-total_resolved   = titled_nodes.agg(F.sum("resolved_titles")).first()[0] or 0
-total_unresolved = titled_nodes.agg(F.sum("unresolved_titles")).first()[0] or 0
-total_refs       = total_resolved + total_unresolved
+n_confirmed_entities  = sum(1 for n in entity_votes.values() if n >= REPEAT_THRESHOLD)
+n_confirmed_relations = sum(1 for n in relation_votes.values() if n >= REPEAT_THRESHOLD)
 
 print()
 print("=" * 80)
-print("TITLE RESOLUTION SUMMARY")
+print("NEXT STEP")
 print("=" * 80)
-print(f"Documents Processed  : {total_docs}")
-print(f"References Total     : {total_refs}")
-print(f"Resolved (title used): {total_resolved}")
-print(f"Unresolved (kept raw): {total_unresolved}")
-if total_refs:
-    print(f"Resolution Rate       : {100*total_resolved/total_refs:.1f}%")
-
-# ----------------------------------------------------------
-# Output Table : doc_id, source, title, new_content, reference
-# ----------------------------------------------------------
-final_table = (
-    titled_nodes
-    .select(
-        "doc_id",
-        "source",
-        F.col("node_name").alias("title"),
-        F.col("final_content").alias("new_content"),
-        F.col("node_id").alias("reference"),
-    )
-)
-
-print()
-print("Final clean, readable content:")
-display(final_table)
+print(f"{n_confirmed_entities} entity categories and {n_confirmed_relations} relation")
+print("categories crossed the repeat threshold. Review the ✅ rows above, merge")
+print("any near-duplicate phrasings, and lock them as ENTITY_TYPES/RELATION_TYPES")
+print("in Cell 9 (Pydantic schema). Count is whatever the evidence supports —")
+print("not chosen in advance.")
