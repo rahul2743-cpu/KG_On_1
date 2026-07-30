@@ -1,3 +1,7 @@
+
+print(f"Content length: {len(test_row['node_content']) if test_row['node_content'] else 0} chars")
+print(test_row["node_content"])
+
 # ==========================================================
 # Cell 13 : Extraction Prompt + GraphRAGExtractor
 # This is where your LLM actually gets called per document.
