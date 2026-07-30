@@ -1,0 +1,72 @@
+# ==========================================================
+# Cell 12 : Pydantic Extraction Models
+# Builds Literal[...] types DYNAMICALLY from whatever ontology
+# came out of Cell 11 — no hardcoded entity/relation names here.
+# ==========================================================
+from typing import Literal, List, Optional
+from pydantic import BaseModel, Field
+
+print("=" * 80)
+print("PYDANTIC EXTRACTION SCHEMA")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# Pull the final category names out of Cell 11's ontology_proposal.
+# If that cell failed for any reason, fall back to reviewing
+# real_tags / real_hub_titles manually instead of guessing.
+# ----------------------------------------------------------
+if "ontology_proposal" in dir() and ontology_proposal:
+    ENTITY_NAMES   = [e["name"] for e in ontology_proposal["entity_types"]]
+    RELATION_NAMES = [r["name"] for r in ontology_proposal["relation_types"]]
+else:
+    raise RuntimeError(
+        "ontology_proposal not found — run Cell 11 successfully first, "
+        "or manually set ENTITY_NAMES / RELATION_NAMES before this cell."
+    )
+
+print(f"Entity types   ({len(ENTITY_NAMES)}): {ENTITY_NAMES}")
+print(f"Relation types ({len(RELATION_NAMES)}): {RELATION_NAMES}")
+
+# ----------------------------------------------------------
+# Dynamic Literal types — this is what makes it impossible for
+# the LLM to return a type outside the discovered ontology.
+# Literal[tuple(names)] is equivalent to Literal[name1, name2, ...]
+# ----------------------------------------------------------
+EntityTypeStr   = Literal[tuple(ENTITY_NAMES)]
+RelationTypeStr = Literal[tuple(RELATION_NAMES)]
+
+# ----------------------------------------------------------
+# Extraction models — same shape as the reference notebook's
+# ExtractedEntity / ExtractedRelationship / ExtractionResult
+# ----------------------------------------------------------
+class ExtractedEntity(BaseModel):
+    name: str = Field(description="Name of the entity, capitalized")
+    type: EntityTypeStr = Field(description="One of the allowed entity types")
+    description: str = Field(description="Brief description of the entity and its role")
+
+
+class ExtractedRelationship(BaseModel):
+    source: str = Field(description="Name of the source entity")
+    target: str = Field(description="Name of the target entity")
+    relation: RelationTypeStr = Field(description="One of the allowed relationship types")
+    description: str = Field(description="Sentence explaining why/how these entities relate")
+
+
+class ExtractionResult(BaseModel):
+    entities: List[ExtractedEntity] = Field(default_factory=list)
+    relationships: List[ExtractedRelationship] = Field(default_factory=list)
+
+
+print()
+print("✅ Schema built.")
+print(f"   ExtractedEntity.type       -> must be one of {ENTITY_NAMES}")
+print(f"   ExtractedRelationship.relation -> must be one of {RELATION_NAMES}")
+
+# ----------------------------------------------------------
+# Quick self-test: confirm invalid types are actually rejected
+# ----------------------------------------------------------
+try:
+    ExtractedEntity(name="Test", type="NOT_A_REAL_TYPE", description="should fail")
+    print("⚠️  WARNING: invalid type was NOT rejected — schema isn't enforcing correctly")
+except Exception:
+    print("✅ Confirmed: an invalid entity type IS rejected by the schema, as expected")
