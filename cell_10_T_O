@@ -1,24 +1,18 @@
 # ==========================================================
-# Cell 10 : Ontology Discovery — count emerges from evidence,
-# not chosen in advance. One LLM call, fed ONLY real aggregated
-# data (tags + hub titles), asked to propose AS MANY OR AS FEW
-# categories as the evidence actually supports.
+# Cell 11 : Ontology Discovery (uses YOUR existing `llm` — 
+#           the ChatOpenAI client from the cell above, no new client needed)
 # ==========================================================
 from pyspark.sql import functions as F
-from databricks_langchain import ChatDatabricks
 import json
 
 print("=" * 80)
-print("GENERIC ONTOLOGY DISCOVERY (data-driven category count)")
+print("ONTOLOGY DISCOVERY (data-driven category count)")
 print("=" * 80)
 
 # ----------------------------------------------------------
-# 1. Gather ALL real evidence, nothing invented.
+# 1. Real evidence, already collected in Cell 9/10
 # ----------------------------------------------------------
-real_tags = [
-    row["tag"] for row in tag_counts.filter(F.col("count") >= 2).collect()
-]  # only tags that repeated — single-occurrence tags are too weak to trust
-
+real_tags = [row["tag"] for row in tag_counts.filter(F.col("count") >= 2).collect()]
 real_hub_titles = [
     row["target_title"] for row in hub_docs_titled
         .filter(F.col("target_title").isNotNull())
@@ -29,60 +23,41 @@ print(f"Repeated tags (≥2 occurrences) : {len(real_tags)}")
 print(f"Resolved hub titles            : {len(real_hub_titles)}")
 
 # ----------------------------------------------------------
-# 2. ONE LLM call. It proposes however many categories the
-#    evidence supports — not a number we chose beforehand.
+# 2. One call, using YOUR existing `llm` object — same
+#    invoke style as your health-check cell above.
 # ----------------------------------------------------------
-llm = ChatDatabricks(endpoint=LLM_ENDPOINT, temperature=0.0, max_tokens=1500)
-
-DISCOVERY_PROMPT = f"""You are analyzing real evidence from a Rolls-Royce engineering wiki
-corpus to design a knowledge-graph ontology.
-
-Below are TWO real, aggregated signals from the actual corpus:
+DISCOVERY_PROMPT = f"""You are analyzing real evidence from a Rolls-Royce engineering
+wiki corpus to design a knowledge-graph ontology.
 
 REPEATED TAGS (appeared on 2+ documents):
 {json.dumps(real_tags)}
 
-TOP REFERENCED DOCUMENT TITLES (most-linked-to documents in the corpus):
+TOP REFERENCED DOCUMENT TITLES (most-linked-to documents):
 {json.dumps(real_hub_titles)}
 
-Task: propose entity categories for a knowledge graph, based ONLY on what
-you see above. Do not assume a target number of categories — propose as
-many as the evidence genuinely supports, and no more. Merge anything that
-looks like the same underlying concept expressed differently. Drop anything
-too vague or too rare to justify its own category.
+Propose entity categories based ONLY on the evidence above. Propose as many
+categories as the evidence genuinely supports — no preset number. Merge
+duplicates, drop anything too vague or too rare.
 
-For each category: give a short UPPER_SNAKE_CASE name, and list which
-specific tags/titles above are the evidence for it.
+For each category: short UPPER_SNAKE_CASE name + which tags/titles are evidence.
+Then propose relationship types that connect these categories.
 
-Then propose relationship types that would plausibly connect entities of
-these categories, again only as many as make sense.
-
-Respond as JSON:
+Respond as JSON only, no other text:
 {{
-  "entity_types": [
-    {{"name": "...", "evidence": ["...", "..."]}}
-  ],
-  "relation_types": [
-    {{"name": "...", "description": "..."}}
-  ]
+  "entity_types": [{{"name": "...", "evidence": ["..."]}}],
+  "relation_types": [{{"name": "...", "description": "..."}}]
 }}
 """
 
-response = llm.invoke(DISCOVERY_PROMPT)
-text = response.content.strip().replace("```json", "").replace("```", "").strip()
-
 try:
+    response = llm.invoke([("human", DISCOVERY_PROMPT)])
+    text = response.content.strip().replace("```json", "").replace("```", "").strip()
     ontology_proposal = json.loads(text)
-except json.JSONDecodeError:
-    print("⚠️  LLM response wasn't valid JSON — raw output below for debugging:")
-    print(text)
-    ontology_proposal = None
 
-if ontology_proposal:
     print()
     print("=" * 80)
     print(f"PROPOSED ONTOLOGY  ({len(ontology_proposal['entity_types'])} entity types, "
-          f"{len(ontology_proposal['relation_types'])} relation types — count is NOT preset)")
+          f"{len(ontology_proposal['relation_types'])} relation types)")
     print("=" * 80)
     for et in ontology_proposal["entity_types"]:
         print(f"\n  {et['name']}")
@@ -90,3 +65,7 @@ if ontology_proposal:
     print()
     for rt in ontology_proposal["relation_types"]:
         print(f"  {rt['name']:22s} — {rt['description']}")
+
+except Exception as e:
+    print(f"❌ LLM call failed: {e}")
+    print("Falling back to manual review — see real_tags / real_hub_titles above.")
