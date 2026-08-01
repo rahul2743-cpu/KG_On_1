@@ -126,14 +126,13 @@ def _parse_records(text, entity_names):
     ]
 
 
-# ---- The distributed worker: runs ONCE PER PARTITION on an executor ------
-def process_partition(rows_iter):
-    """
-    Builds ONE LLM client per partition (reused across every document in
-    that partition, not rebuilt per row), then processes each document.
-    A failure on any single document is caught and logged -- it does not
-    abort the partition or the job.
-    """
+# ---- The distributed worker: runs on an executor, once per Arrow batch --
+# Rewritten for mapInPandas (RDD-based mapPartitions is NOT allowed on
+# serverless compute -- see Databricks error [NOT_IMPLEMENTED]). Same idea
+# as before: one LLM client built per batch and reused, one document
+# processed at a time, one bad document never kills the whole run.
+def process_partition_pandas(pdf_iterator):
+    import pandas as pd
     from langchain_openai import ChatOpenAI
 
     partition_llm = ChatOpenAI(
@@ -141,39 +140,57 @@ def process_partition(rows_iter):
         api_key=_CONN["api_key"], temperature=0,
     )
 
-    for row in rows_iter:
-        entities = row["entities"]
-        entity_names = [e["target_title"] for e in entities]
+    out_columns = [
+        "source_node", "source_title", "predicate",
+        "relationship_description", "relationship_strength",
+        "target_title", "target_reference", "link_type",
+    ]
 
-        try:
-            entity_list_str = "\n".join(f"- {n}" for n in entity_names)
-            clean_content = _sanitize_for_llm(row["content_with_titles"])
-            if len(clean_content) > MAX_CONTENT_CHARS:
-                clean_content = clean_content[:MAX_CONTENT_CHARS] + " ...[truncated]"
+    for pdf in pdf_iterator:
+        out_rows = []
 
-            user_prompt = (
-                f"SOURCE document title: {row['source_title']}\n\n"
-                f"Target entities to describe (in this order):\n{entity_list_str}\n\n"
-                f"Document text:\n{clean_content}"
-            )
+        for _, row in pdf.iterrows():
+            entities = row["entities"]   # list of dict-like structs (target_title/target_reference/link_type)
+            entity_names = [e["target_title"] for e in entities]
 
-            resp = partition_llm.invoke([
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ])
-            results = _parse_records(resp.content.strip(), entity_names)
+            try:
+                entity_list_str = "\n".join(f"- {n}" for n in entity_names)
+                clean_content = _sanitize_for_llm(row["content_with_titles"])
+                if len(clean_content) > MAX_CONTENT_CHARS:
+                    clean_content = clean_content[:MAX_CONTENT_CHARS] + " ...[truncated]"
 
-        except Exception as e:
-            # ONE bad document -> log it, fall back to safe defaults for
-            # every one of its entities, keep going. Never crash the job.
-            results = [("related_to", f"[extraction failed: {e}]", 1) for _ in entities]
+                user_prompt = (
+                    f"SOURCE document title: {row['source_title']}\n\n"
+                    f"Target entities to describe (in this order):\n{entity_list_str}\n\n"
+                    f"Document text:\n{clean_content}"
+                )
 
-        for entity, (predicate, description, strength) in zip(entities, results):
-            yield (
-                row["source_node"], row["source_title"], predicate,
-                description, strength,
-                entity["target_title"], entity["target_reference"], entity["link_type"],
-            )
+                resp = partition_llm.invoke([
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ])
+                results = _parse_records(resp.content.strip(), entity_names)
+
+            except Exception as e:
+                # ONE bad document -> log it, fall back to safe defaults for
+                # every one of its entities, keep going. Never crash the job.
+                results = [("related_to", f"[extraction failed: {e}]", 1) for _ in entities]
+
+            for entity, (predicate, description, strength) in zip(entities, results):
+                out_rows.append({
+                    "source_node": row["source_node"],
+                    "source_title": row["source_title"],
+                    "predicate": predicate,
+                    "relationship_description": description,
+                    "relationship_strength": strength,
+                    "target_title": entity["target_title"],
+                    "target_reference": entity["target_reference"],
+                    "link_type": entity["link_type"],
+                })
+
+        # ALWAYS yield a DataFrame with the right columns, even if empty --
+        # mapInPandas requires the schema to match on every yielded batch.
+        yield pd.DataFrame(out_rows, columns=out_columns)
 
 
 TRIPLES_SCHEMA = StructType([
@@ -226,14 +243,16 @@ print(f"Documents to process this run  : {n_docs_to_process}")
 if n_docs_to_process == 0:
     print("Nothing to do -- all documents already checkpointed.")
 else:
-    # ---- Step 3: distributed extraction -----------------------------------
-    result_rdd = (
+    # ---- Step 3: distributed extraction (mapInPandas -- serverless-safe) --
+    # NOTE: .rdd.mapPartitions() is BLOCKED on Databricks serverless compute
+    # ([NOT_IMPLEMENTED] "Using custom code using PySpark RDDs is not
+    # allowed on serverless compute"). mapInPandas achieves the same
+    # distributed-processing goal without touching the RDD API.
+    new_triples_df = (
         doc_prompt_inputs
         .repartition(N_PARTITIONS)
-        .rdd
-        .mapPartitions(process_partition)
+        .mapInPandas(process_partition_pandas, schema=TRIPLES_SCHEMA)
     )
-    new_triples_df = spark.createDataFrame(result_rdd, schema=TRIPLES_SCHEMA)
 
     # ---- Step 4: checkpoint immediately (append, don't wait for the end) --
     (new_triples_df.write
