@@ -24,7 +24,9 @@ def _norm_py(ref):
 
 
 def render_plain(text):
-    """Full document, every link -> <Resolved Title>."""
+    """Full document, every link -> <Resolved Title>. Unresolved links
+    are left exactly as they appeared in the source (e.g.
+    "[<doc:wiki:Temp_Import...WebHome>]") — nothing rebuilt or guessed."""
     if not text:
         return text
     lookup = hyperlink_title_dict
@@ -32,7 +34,7 @@ def render_plain(text):
     def repl(m):
         ref = _norm_py(m.group("ref"))
         title = lookup.get(ref)
-        return f"<{title}>" if title else f"[UNRESOLVED:{ref}]"
+        return f"<{title}>" if title else m.group(0)   # keep original text
 
     out = LINK_RE.sub(repl, text)
     out = re.sub(r"[ \t]*\n[ \t]*", " ", out)
@@ -40,7 +42,9 @@ def render_plain(text):
 
 
 def render_html(text):
-    """Full document as HTML — every link -> blue hyperlink span."""
+    """Full document as HTML — every link -> blue hyperlink span.
+    Unresolved links are left exactly as the original source text,
+    unstyled — not flagged, not guessed."""
     if not text:
         return text
     lookup = hyperlink_title_dict
@@ -52,7 +56,7 @@ def render_html(text):
             safe = title.replace("&", "&amp;").replace('"', "&quot;")
             return (f'<a href="#{ref}" '
                     f'style="color:#0645ad;text-decoration:none">{safe}</a>')
-        return f'<span style="color:#cc0000">[UNRESOLVED:{ref}]</span>'
+        return m.group(0)   # keep original text, e.g. "[<doc:wiki:Ref>]"
 
     out = LINK_RE.sub(repl, text)
     out = re.sub(r"[ \t]*\n[ \t]*", " ", out)
