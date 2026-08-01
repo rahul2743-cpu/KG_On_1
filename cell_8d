@@ -56,7 +56,15 @@ def render_html(text):
             safe = title.replace("&", "&amp;").replace('"', "&quot;")
             return (f'<a href="#{ref}" '
                     f'style="color:#0645ad;text-decoration:none">{safe}</a>')
-        return m.group(0)   # keep original text, e.g. "[<doc:wiki:Ref>]"
+        # Unresolved -> keep the ORIGINAL text, but HTML-escape it first.
+        # Without this, the browser sees the raw "<doc:wiki:...>" and
+        # tries to parse it as an actual (unknown) HTML tag -- and since
+        # unknown tags render invisibly, the text silently disappears in
+        # displayHTML(), even though it's correctly present as plain text.
+        raw = m.group(0)
+        return (raw.replace("&", "&amp;")
+                   .replace("<", "&lt;")
+                   .replace(">", "&gt;"))
 
     out = LINK_RE.sub(repl, text)
     out = re.sub(r"[ \t]*\n[ \t]*", " ", out)
