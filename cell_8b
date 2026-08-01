@@ -1,0 +1,201 @@
+# ==========================================================
+# Cell 8b : Extract every link OCCURRENCE with its sentence,
+#           mask it -> <System Of Interest>, resolve target_title.
+#           Uses the SAME pattern pieces as Cell 7 (drift-checked).
+#           Needs: hyperlinks_df, total_links (Cell 7)
+#                  knowledge_nodes (Cell 6)
+#                  hyperlink_title_dict, title_lookup (Cell 8a)
+# ==========================================================
+import re
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    ArrayType, StructType, StructField, StringType, IntegerType
+)
+
+print("=" * 80)
+print("CELL 8b — SENTENCE EXTRACTION & TITLE RESOLUTION")
+print("=" * 80)
+
+MARKER      = "@@LINK@@"
+PLACEHOLDER = "<System Of Interest>"   # fixed masking label — constant BY DESIGN
+MAX_SENT    = 600
+
+
+def normalize_ref_col(c):
+    c = F.trim(c)
+    c = F.regexp_replace(c, r"^xwiki:", "")
+    c = F.regexp_replace(c, r"\s+", "")
+    return c
+
+
+LINK_RE = re.compile(
+    r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?P<wiki>wiki:)?(?P<ref>[^>]+)>\]"
+)
+
+# ---- drift guard: Cell 8b's LINK_RE must match Cell 7's FULL_MATCH ----
+try:
+    _EXPECTED = r"\[(?:[^<>\[\]]+?\s+)?<doc:(?:wiki:)?[^>]+>\]"
+    assert FULL_MATCH == _EXPECTED, (
+        "Cell 7's FULL_MATCH changed — update Cell 8b's LINK_RE to match."
+    )
+    print("✅ Cell 8b's link pattern still matches Cell 7's FULL_MATCH")
+except NameError:
+    print("⚠️  FULL_MATCH not found — run Cell 7 before Cell 8b.")
+
+# single \n = line-wrap, not a sentence end; only punctuation / blank line ends one
+_LEFT_STOP  = re.compile(r"[.!?;:]|\n\s*\n")
+_RIGHT_STOP = re.compile(r"[.!?;]|\n\s*\n")
+
+LINK_SCHEMA = ArrayType(StructType([
+    StructField("occurrence",       IntegerType()),
+    StructField("display_text",     StringType()),
+    StructField("link_type",        StringType()),
+    StructField("target_reference", StringType()),
+    StructField("sentence_marked",  StringType()),
+]))
+
+
+def _sentence_bounds(text, s, e, spans):
+    # stop chars INSIDE another link's span (ref ids contain literal '.') are ignored
+    def inside_any(pos):
+        return any(sp <= pos < ep for sp, ep in spans)
+
+    lo = max(0, s - MAX_SENT)
+    search_pos, last_stop = lo, None
+    while True:
+        m = _LEFT_STOP.search(text, search_pos, s)
+        if not m:
+            break
+        if not inside_any(m.start()):
+            last_stop = m
+        search_pos = m.end()
+    start = last_stop.end() if last_stop else lo
+
+    hi = min(len(text), e + MAX_SENT)
+    search_pos, end = e, hi
+    while True:
+        m = _RIGHT_STOP.search(text, search_pos, hi)
+        if not m:
+            break
+        if not inside_any(m.start()):
+            end = m.end()
+            break
+        search_pos = m.end()
+    return start, end
+
+
+def extract_and_replace(text):
+    if not text:
+        return []
+    matches = list(LINK_RE.finditer(text))
+    if not matches:
+        return []
+
+    spans  = [m.span() for m in matches]
+    lookup = hyperlink_title_dict
+
+    def norm(ref):
+        r = ref.strip()
+        r = re.sub(r"^xwiki:", "", r)
+        r = re.sub(r"\s+", "", r)
+        return r
+
+    parsed = [{
+        "span":  m.span(),
+        "label": (m.group("label") or "").strip(),
+        "ref":   m.group("ref").strip(),
+        "wiki":  bool(m.group("wiki")),
+        "title": lookup.get(norm(m.group("ref"))),
+    } for m in matches]
+
+    rows = []
+    for i, p in enumerate(parsed):
+        s, e = p["span"]
+        start, end = _sentence_bounds(text, s, e, spans)
+
+        pieces, cursor = [], start
+        for j, q in enumerate(parsed):
+            qs, qe = q["span"]
+            if qs < start or qe > end:
+                continue
+            pieces.append(text[cursor:qs])
+            if j == i:
+                pieces.append(MARKER)
+            elif q["title"]:
+                pieces.append(f"<{q['title']}>")
+            else:
+                pieces.append(f"[UNRESOLVED:{q['ref']}]")
+            cursor = qe
+        pieces.append(text[cursor:end])
+
+        sent = re.sub(r"\s+", " ", "".join(pieces)).strip()
+        rows.append((
+            i, p["label"],
+            "doc:wiki" if p["wiki"] else "doc:Temp_Import",
+            p["ref"], sent,
+        ))
+    return rows
+
+
+extract_udf = F.udf(extract_and_replace, LINK_SCHEMA)
+
+links_with_context = (
+    knowledge_nodes
+    .select("source", "node_id", "node_name", "node_content")
+    .withColumn("_l", F.explode(extract_udf(F.col("node_content"))))
+    .select(
+        F.col("source"),
+        F.col("node_id").alias("source_node"),
+        F.col("node_name").alias("source_title"),
+        F.col("_l.occurrence").alias("occurrence"),
+        F.col("_l.display_text").alias("display_text"),
+        F.col("_l.link_type").alias("link_type"),
+        normalize_ref_col(F.col("_l.target_reference")).alias("target_reference"),
+        F.col("_l.sentence_marked").alias("sentence_marked"),
+    )
+).cache()
+
+n_occ = links_with_context.count()
+print(f"Link occurrences (Cell 8b) : {n_occ}")
+try:
+    print(f"Link total  (Cell 7)       : {total_links}   (delta = {n_occ - total_links})")
+except NameError:
+    pass
+
+sentences_df = (
+    links_with_context
+    .join(title_lookup, on="target_reference", how="left")
+    .withColumnRenamed("title", "target_title")
+    .withColumn("is_resolved", F.col("target_title").isNotNull())
+
+    .withColumn(
+        "sentence",
+        F.when(
+            F.col("is_resolved"),
+            F.expr("replace(sentence_marked, '@@LINK@@', concat('<', target_title, '>'))")
+        ).otherwise(
+            F.expr("replace(sentence_marked, '@@LINK@@', "
+                   "concat('[UNRESOLVED:', target_reference, ']'))")
+        )
+    )
+    .withColumn(
+        "sentence_masked",
+        F.expr(f"replace(sentence_marked, '@@LINK@@', '{PLACEHOLDER}')")
+    )
+    .withColumn(
+        "link_uid",
+        F.sha2(F.concat_ws("||", "source_node", "target_reference",
+                           F.col("occurrence").cast("string")), 256)
+    )
+    .select(
+        "link_uid", "source", "source_node", "source_title",
+        "target_reference", "target_title", "is_resolved",
+        "link_type", "occurrence", "sentence", "sentence_masked"
+    )
+).cache()
+
+print()
+print(f"sentences_df row count : {sentences_df.count()}")
+display(sentences_df.select(
+    "source_title", "target_title", "link_type", "sentence", "sentence_masked"
+))
