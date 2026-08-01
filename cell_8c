@@ -1,0 +1,46 @@
+# ==========================================================
+# Cell 8c : Diagnostics — resolution rate overall and by link_type.
+#           doc:wiki (cross-wiki reference) is expected to resolve
+#           lower than doc:Temp_Import (local import) — this shows
+#           the real numbers instead of a guess.
+#           Needs: sentences_df (Cell 8b)
+# ==========================================================
+from pyspark.sql import functions as F
+
+print("=" * 80)
+print("CELL 8c — RESOLUTION DIAGNOSTICS")
+print("=" * 80)
+
+n_total      = sentences_df.count()
+n_resolved   = sentences_df.filter(F.col("is_resolved")).count()
+n_unresolved = n_total - n_resolved
+
+print(f"Sentences (1 per link occurrence) : {n_total}")
+print(f"Title resolved via dictionary     : {n_resolved}")
+print(f"Unresolved (target not in table)  : {n_unresolved}"
+      f"  ({0 if not n_total else round(100 * n_unresolved / n_total, 1)}%)")
+
+print()
+print("Resolution rate by link_type (doc:wiki is expected to be lower):")
+display(
+    sentences_df
+    .groupBy("link_type")
+    .agg(
+        F.count("*").alias("total"),
+        F.sum(F.col("is_resolved").cast("int")).alias("resolved"),
+    )
+    .withColumn("resolved_pct", F.round(100 * F.col("resolved") / F.col("total"), 1))
+    .orderBy("link_type")
+)
+
+if n_unresolved:
+    print()
+    print("Top unresolved targets:")
+    display(
+        sentences_df
+        .filter(~F.col("is_resolved"))
+        .groupBy("target_reference", "link_type")
+        .agg(F.count("*").alias("hits"))
+        .orderBy(F.desc("hits"))
+        .limit(20)
+    )
