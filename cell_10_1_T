@@ -1,0 +1,163 @@
+# ==========================================================
+# Cell 10 : LLM PREDICATE EXTRACTION  (GraphRAG-style relationship
+#           extraction, adapted from Edge et al. 2024, Section 3.1.2 /
+#           Appendix A.1 & E.1: "From Local to Global: A GraphRAG
+#           Approach to Query-Focused Summarization")
+#
+#           GraphRAG's LLM call does THREE things: (1) find entities,
+#           (2) find relationships between them, (3) describe each
+#           relationship + give it a numeric strength. We only need
+#           step (3) -- our source_title / target_title are ALREADY
+#           known from the hyperlink itself, so there's no entity
+#           discovery to do. The LLM's only job: describe HOW they're
+#           related, and how strong that relationship is.
+#
+#           Output format uses GraphRAG's delimiter-based tuples
+#           instead of JSON -- degrades more gracefully at scale than
+#           JSON does when the model's formatting slips.
+#
+#           Output: triples_df (source_title, predicate,
+#                    relationship_description, relationship_strength,
+#                    target_title)
+#           Needs: sentences_df (Cell 8b), llm (Cell 9)
+# ==========================================================
+import re
+from pyspark.sql import functions as F, Row
+
+print("=" * 80)
+print("CELL 10 — LLM PREDICATE EXTRACTION")
+print("=" * 80)
+
+BATCH_SIZE = 10   # smaller than a pure-predicate batch -- each record now
+                  # carries a full description too, so fewer per call keeps
+                  # the model from truncating output mid-batch
+
+# Only rows with a REAL target entity can form a meaningful graph edge.
+# Unresolved links (no title -> no second entity) are excluded here.
+# See Cell 8c for exactly how many that is and why (e.g. doc:wiki targets
+# outside this table).
+edge_candidates = (
+    sentences_df
+    .filter(F.col("is_resolved"))
+    .select("link_uid", "source_title", "target_title", "link_type", "sentence_masked")
+).cache()
+
+n_candidates = edge_candidates.count()
+print(f"Resolved link occurrences (candidate edges) : {n_candidates}")
+
+rows = edge_candidates.collect()
+
+# ---- GraphRAG-style delimiters (Appendix E.1) ----
+TUPLE_DELIM  = "<|>"
+RECORD_DELIM = "##"
+
+SYSTEM_PROMPT = f"""---Role---
+You are an AI assistant extracting relationships for a knowledge graph.
+
+---Goal---
+For each numbered sentence below, the SOURCE entity and the phrase
+"<System Of Interest>" (the TARGET entity, name hidden on purpose) are
+connected by some relationship expressed in that sentence. The entities
+are already known -- do NOT name them, do NOT invent new entities. Your
+only job is to describe the relationship between SOURCE and TARGET.
+
+For each numbered sentence, extract:
+- predicate: a short verb phrase (2-5 words, lowercase, present tense),
+  e.g. "is subject to", "is formalised under", "achieves combination with"
+- description: one sentence explaining WHY / HOW they are related,
+  grounded only in what the sentence actually says
+- strength: an integer 1-10 score for how strong/explicit the relationship
+  is in the text (10 = directly and unambiguously stated, 1 = weak/implied)
+
+---Output format---
+One record per input sentence, in the SAME ORDER, formatted exactly as:
+<index>{TUPLE_DELIM}<predicate>{TUPLE_DELIM}<description>{TUPLE_DELIM}<strength>{RECORD_DELIM}
+
+Example, given input sentence 1 with SOURCE=Trent Engine Family:
+1{TUPLE_DELIM}is subject to{TUPLE_DELIM}The Trent engine family is subject to the blocking rules described by the System Of Interest.{TUPLE_DELIM}8{RECORD_DELIM}
+
+No JSON. No markdown. No preamble or explanation outside the records."""
+
+
+def _parse_records(text, expected_n):
+    """Parse GraphRAG-style delimited records into a list of
+    (predicate, description, strength) tuples, indexed by position.
+    Falls back to a safe default for any index the model dropped or
+    mangled -- a malformed record never crashes the batch."""
+    parsed = {}
+    for record in text.split(RECORD_DELIM):
+        record = record.strip().strip(",")
+        if not record:
+            continue
+        parts = [p.strip() for p in record.split(TUPLE_DELIM)]
+        if len(parts) < 3:
+            continue
+        try:
+            idx = int(re.sub(r"\D", "", parts[0]))
+        except ValueError:
+            continue
+        predicate = parts[1] if len(parts) > 1 else "related to"
+        description = parts[2] if len(parts) > 2 else ""
+        try:
+            strength = max(1, min(10, int(re.sub(r"\D", "", parts[3]))))
+        except (ValueError, IndexError):
+            strength = 5
+        parsed[idx] = (predicate, description, strength)
+
+    return [
+        parsed.get(i + 1, ("related to", "", 5))
+        for i in range(expected_n)
+    ]
+
+
+def call_llm_batch(batch):
+    """batch: list of Row(link_uid, source_title, target_title, link_type, sentence_masked)"""
+    numbered = "\n".join(
+        f"{i+1}. [SOURCE={r['source_title']}] {r['sentence_masked']}"
+        for i, r in enumerate(batch)
+    )
+    user_prompt = f"Sentences:\n{numbered}"
+
+    resp = llm.invoke([
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ])
+
+    return _parse_records(resp.content.strip(), len(batch))
+
+
+all_results = []
+for start in range(0, len(rows), BATCH_SIZE):
+    batch = rows[start:start + BATCH_SIZE]
+    results = call_llm_batch(batch)
+    all_results.extend(results)
+    print(f"  processed {min(start + BATCH_SIZE, len(rows))}/{len(rows)} sentences")
+
+print()
+print(f"Relationships extracted : {len(all_results)}")
+
+# ---- Assemble the final triples (now richer than a bare predicate) ----
+triple_rows = [
+    Row(
+        link_uid=r["link_uid"],
+        source_title=r["source_title"],
+        predicate=all_results[i][0],
+        relationship_description=all_results[i][1],
+        relationship_strength=all_results[i][2],
+        target_title=r["target_title"],
+        link_type=r["link_type"],
+        sentence=r["sentence_masked"],
+    )
+    for i, r in enumerate(rows)
+]
+
+triples_df = spark.createDataFrame(triple_rows).cache()
+
+print()
+print(f"triples_df row count : {triples_df.count()}")
+print()
+print("Sample triples (source_title --[predicate, strength]--> target_title):")
+display(triples_df.select(
+    "source_title", "predicate", "relationship_strength",
+    "target_title", "relationship_description", "link_type"
+))
