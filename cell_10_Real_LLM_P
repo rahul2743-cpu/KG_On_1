@@ -1,0 +1,197 @@
+# ==========================================================
+# Cell 10 : LLM RELATIONSHIP EXTRACTION  (whole-document context)
+#           GraphRAG-style extraction (Edge et al. 2024, Sec 3.1.2),
+#           but adapted: our entities are ALREADY marked in the text
+#           as <Entity Name> (Cell 8d's blue-hyperlink rendering), so
+#           the LLM never has to discover entities -- only describe
+#           the relationship between the SOURCE document and each
+#           marked entity, using the FULL document as context rather
+#           than one isolated sentence. This is the whole point of
+#           feeding it document_rendered_df.content_with_titles
+#           instead of a masked one-line sentence: the model can see
+#           how an entity is used throughout the document, not just
+#           in the one sentence nearest its hyperlink.
+#
+#           Output: triples_df (source_title, predicate,
+#                    relationship_description, relationship_strength,
+#                    target_title, link_type)
+#           Needs: sentences_df (Cell 8b), document_rendered_df (Cell 8d),
+#                  llm (Cell 9)
+# ==========================================================
+import re
+from pyspark.sql import functions as F, Row
+
+print("=" * 80)
+print("CELL 10 — LLM RELATIONSHIP EXTRACTION (full-document context)")
+print("=" * 80)
+
+MAX_CONTENT_CHARS = 12000   # safety cap per document sent to the LLM
+
+# ---- Step 1: distinct resolved (document -> entity) pairs -------------
+# One row per unique target entity actually mentioned in each document.
+# If a target appears 3 times in the same doc, that's ONE relationship
+# to extract, not three -- the full-document prompt covers all mentions
+# at once, which is exactly why this is better than the old per-sentence
+# approach.
+distinct_targets = (
+    sentences_df
+    .filter(F.col("is_resolved"))
+    .select("source_node", "source_title", "target_reference", "target_title", "link_type")
+    .distinct()
+)
+
+doc_entities = (
+    distinct_targets
+    .groupBy("source_node", "source_title")
+    .agg(F.collect_list(
+        F.struct("target_title", "target_reference", "link_type")
+    ).alias("entities"))
+)
+
+# ---- Step 2: attach the FULL rendered document content (Cell 8d) ------
+doc_prompt_inputs = (
+    doc_entities
+    .join(
+        document_rendered_df.select("source_node", "content_with_titles"),
+        on="source_node", how="inner"
+    )
+)
+
+n_docs = doc_prompt_inputs.count()
+print(f"Documents with resolved entities : {n_docs}")
+
+rows = doc_prompt_inputs.collect()
+
+# ---- GraphRAG-style delimiters (Appendix E.1) --------------------------
+TUPLE_DELIM  = "<|>"
+RECORD_DELIM = "##"
+
+SYSTEM_PROMPT = f"""---Role---
+You are an AI assistant extracting relationships for a knowledge graph.
+
+---Goal---
+You are given ONE FULL DOCUMENT (the SOURCE entity) and a list of TARGET
+entities that are already marked inside the document text as <Entity Name>.
+The entities are already known -- do NOT invent new ones, do NOT rename
+them. Your only job: for EACH target entity listed, read how it is used
+across the WHOLE document (it may be mentioned more than once) and
+describe its relationship to the source document.
+
+For each target entity, extract:
+- predicate: a short relationship label in snake_case (lowercase words
+  joined by underscores, 2-5 words), e.g. "is_subject_to",
+  "is_formalised_under", "achieves_combination_with", "is_defined_by",
+  "depends_on". NO spaces, NO hyphens -- underscores only.
+- description: 1-2 sentences explaining WHY / HOW the source document and
+  this entity are related, grounded ONLY in what the document actually says
+- strength: an integer 1-10 for how strong/explicit the relationship is
+  (10 = central to the document, explicitly and repeatedly stated;
+   1 = a passing, incidental mention)
+
+---Output format---
+One record per target entity, in the SAME ORDER as the entity list given
+to you, formatted EXACTLY as:
+<entity name>{TUPLE_DELIM}<predicate>{TUPLE_DELIM}<description>{TUPLE_DELIM}<strength>{RECORD_DELIM}
+
+Example, given target entity "Trent Engine Family":
+Trent Engine Family{TUPLE_DELIM}is_subject_to{TUPLE_DELIM}The document defines blocking rules that the Trent Engine Family must follow during endurance testing.{TUPLE_DELIM}8{RECORD_DELIM}
+
+No JSON. No markdown. No preamble or explanation outside the records.
+One record per entity listed -- do not skip any, do not add extras."""
+
+
+def _to_snake_case(s):
+    """Guarantee snake_case regardless of what the LLM actually returns --
+    lowercase, spaces/hyphens/punctuation -> underscore, collapse repeats,
+    strip leading/trailing underscores."""
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "related_to"
+
+
+def _parse_records(text, entity_names):
+    """Match records by ENTITY NAME (not position) -- more robust than
+    index-matching when the model reorders or skips an entity, since a
+    document can list many entities and full-document prompts are more
+    prone to the model re-grouping its answer."""
+    by_name = {}
+    for record in text.split(RECORD_DELIM):
+        record = record.strip().strip(",")
+        if not record:
+            continue
+        parts = [p.strip() for p in record.split(TUPLE_DELIM)]
+        if len(parts) < 3:
+            continue
+        name = parts[0].strip().lower()
+        predicate = _to_snake_case(parts[1]) if len(parts) > 1 else "related_to"
+        description = parts[2] if len(parts) > 2 else ""
+        try:
+            strength = max(1, min(10, int(re.sub(r"\D", "", parts[3]))))
+        except (ValueError, IndexError):
+            strength = 5
+        by_name[name] = (predicate, description, strength)
+
+    return [
+        by_name.get(name.strip().lower(), ("related_to", "", 5))
+        for name in entity_names
+    ]
+
+
+def call_llm_for_document(source_title, content, entities):
+    """entities: list of Row(target_title, target_reference, link_type)"""
+    entity_names = [e["target_title"] for e in entities]
+    entity_list_str = "\n".join(f"- {n}" for n in entity_names)
+
+    truncated = content
+    if len(truncated) > MAX_CONTENT_CHARS:
+        truncated = truncated[:MAX_CONTENT_CHARS] + " ...[truncated]"
+
+    user_prompt = (
+        f"SOURCE document title: {source_title}\n\n"
+        f"Target entities to describe (in this order):\n{entity_list_str}\n\n"
+        f"Document text:\n{truncated}"
+    )
+
+    resp = llm.invoke([
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ])
+
+    return _parse_records(resp.content.strip(), entity_names)
+
+
+# ---- Step 3: one LLM call per document ---------------------------------
+triple_rows = []
+for i, r in enumerate(rows):
+    entities = r["entities"]
+    results = call_llm_for_document(r["source_title"], r["content_with_titles"], entities)
+
+    for entity, (predicate, description, strength) in zip(entities, results):
+        triple_rows.append(Row(
+            source_node=r["source_node"],
+            source_title=r["source_title"],
+            predicate=predicate,
+            relationship_description=description,
+            relationship_strength=strength,
+            target_title=entity["target_title"],
+            target_reference=entity["target_reference"],
+            link_type=entity["link_type"],
+        ))
+
+    print(f"  processed {i + 1}/{len(rows)} documents "
+          f"({len(entities)} entities) — {r['source_title']}")
+
+print()
+print(f"Relationships extracted : {len(triple_rows)}")
+
+triples_df = spark.createDataFrame(triple_rows).cache()
+
+print()
+print(f"triples_df row count : {triples_df.count()}")
+print()
+print("Sample triples (source_title --[predicate, strength]--> target_title):")
+display(triples_df.select(
+    "source_title", "predicate", "relationship_strength",
+    "target_title", "relationship_description", "link_type"
+))
