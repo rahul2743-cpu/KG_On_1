@@ -52,6 +52,7 @@ LINK_SCHEMA = ArrayType(StructType([
     StructField("link_type",        StringType()),
     StructField("target_reference", StringType()),
     StructField("sentence_marked",  StringType()),
+    StructField("target_raw",       StringType()),   # original text, e.g. "[<doc:wiki:Ref>]"
 ]))
 
 
@@ -102,6 +103,7 @@ def extract_and_replace(text):
 
     parsed = [{
         "span":  m.span(),
+        "raw":   m.group(0),                        # ORIGINAL text, untouched
         "label": (m.group("label") or "").strip(),
         "ref":   m.group("ref").strip(),
         "wiki":  bool(m.group("wiki")),
@@ -124,7 +126,7 @@ def extract_and_replace(text):
             elif q["title"]:
                 pieces.append(f"<{q['title']}>")
             else:
-                pieces.append(f"[UNRESOLVED:{q['ref']}]")
+                pieces.append(q["raw"])   # unresolved -> keep ORIGINAL text as-is
             cursor = qe
         pieces.append(text[cursor:end])
 
@@ -132,7 +134,7 @@ def extract_and_replace(text):
         rows.append((
             i, p["label"],
             "doc:wiki" if p["wiki"] else "doc:Temp_Import",
-            p["ref"], sent,
+            p["ref"], sent, p["raw"],
         ))
     return rows
 
@@ -152,6 +154,7 @@ links_with_context = (
         F.col("_l.link_type").alias("link_type"),
         normalize_ref_col(F.col("_l.target_reference")).alias("target_reference"),
         F.col("_l.sentence_marked").alias("sentence_marked"),
+        F.col("_l.target_raw").alias("target_raw"),
     )
 ).cache()
 
@@ -174,8 +177,10 @@ sentences_df = (
             F.col("is_resolved"),
             F.expr("replace(sentence_marked, '@@LINK@@', concat('<', target_title, '>'))")
         ).otherwise(
-            F.expr("replace(sentence_marked, '@@LINK@@', "
-                   "concat('[UNRESOLVED:', target_reference, ']'))")
+            # unresolved -> keep the ORIGINAL text exactly as it appeared
+            # (e.g. "[<doc:wiki:Temp_Import.xxx.WebHome>]"), not a rebuilt
+            # placeholder that would drop the doc:wiki: prefix
+            F.expr("replace(sentence_marked, '@@LINK@@', target_raw)")
         )
     )
     .withColumn(
@@ -190,7 +195,7 @@ sentences_df = (
     .select(
         "link_uid", "source", "source_node", "source_title",
         "target_reference", "target_title", "is_resolved",
-        "link_type", "occurrence", "sentence", "sentence_masked"
+        "link_type", "occurrence", "sentence", "sentence_masked", "target_raw"
     )
 ).cache()
 
