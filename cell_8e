@@ -1,0 +1,41 @@
+# ==========================================================
+# Cell 8e : ACTUALLY RENDER the blue hyperlinks.
+#           display() always shows HTML as literal tag text —
+#           it never draws it. displayHTML() is what renders it.
+#           Needs: document_rendered_df (Cell 8d)
+# ==========================================================
+
+# ---- Option 1: preview ONE document by its node_id ----
+DOC_TO_PREVIEW = None   # <- put a source_node value here, e.g. "MyDoc.WebHome"
+
+if DOC_TO_PREVIEW:
+    row = (
+        document_rendered_df
+        .filter(F.col("source_node") == DOC_TO_PREVIEW)
+        .select("source_title", "content_html")
+        .first()
+    )
+    if row:
+        displayHTML(f"<h3>{row['source_title']}</h3>{row['content_html']}")
+    else:
+        print(f"No document found with source_node = {DOC_TO_PREVIEW!r}")
+
+# ---- Option 2: preview the FIRST N documents, one after another ----
+N = 5
+rows = (
+    document_rendered_df
+    .select("source_title", "content_html")
+    .limit(N)
+    .collect()
+)
+
+blocks = "".join(
+    f"<h3 style='margin-top:28px'>{r['source_title']}</h3>{r['content_html']}"
+    for r in rows
+)
+
+displayHTML(f"""
+<div style="font-family:Georgia,serif;line-height:1.7;max-width:900px">
+  {blocks}
+</div>
+""")
