@@ -1,136 +1,431 @@
 # ==========================================================
-# Cell 8 : Ontology Discovery — LLM reads REAL document content
-# from Cell 6's `knowledge_nodes`. Fully generic — works whether
-# you loaded 50 or 500+ docs. Entity/relation categories emerge
-# from evidence across a sample; count is NOT preset.
+# Stage 6 : Hyperlink -> Title Resolution & Sentence Context
+# Cell 8 : Build a {reference: title} DICTIONARY straight from
+#          Cell 7's hyperlinks_df, then use it to replace every
+#          <doc:...> / <doc:wiki:...> occurrence inside the
+#          content with the real document TITLE.
+#
+#   Cell 7 already found every hyperlink (source, target_reference,
+#   link_type). Cell 8 does NOT re-discover links with a new regex —
+#   it reuses Cell 7's own pattern pieces, so the two cells can never
+#   disagree on what counts as a link. It only adds:
+#     1. the real TITLE for each target_reference (dictionary lookup)
+#     2. the SENTENCE each link occurrence sits in (needed for the
+#        LLM predicate step in Cell 9)
 # ==========================================================
+import re
 from pyspark.sql import functions as F
-import json
-
-print("=" * 80)
-print("CONTENT-BASED ONTOLOGY DISCOVERY")
-print("=" * 80)
-
-total_docs = knowledge_nodes.count()
-print(f"Total documents available : {total_docs}")
-
-# ----------------------------------------------------------
-# 1. Sample size scales with corpus size — enough to see real
-#    repetition, not so much that cost balloons at 100-500+ docs.
-#    Skip empty/stub documents (same fix as the doc_id=40 case).
-# ----------------------------------------------------------
-MIN_CONTENT_LENGTH = 200
-SAMPLE_SIZE = min(30, total_docs)   # cap at 30 regardless of corpus size — cheap, still solid evidence
-
-eligible_docs = knowledge_nodes.filter(
-    F.length(F.coalesce(F.col("node_content"), F.lit(""))) >= MIN_CONTENT_LENGTH
+from pyspark.sql.window import Window
+from pyspark.sql.types import (
+    ArrayType, StructType, StructField, StringType, IntegerType
 )
 
-n_eligible = eligible_docs.count()
-print(f"Documents with real content (≥{MIN_CONTENT_LENGTH} chars) : {n_eligible}")
+print("=" * 80)
+print("HYPERLINK -> TITLE DICTIONARY  +  SENTENCE CONTEXT  (Cell 8)")
+print("=" * 80)
 
-sample_docs = (
-    eligible_docs
-    .select("doc_id", "node_name", "node_content")
-    .orderBy(F.rand(seed=42))          # random across the WHOLE corpus, not first-N
-    .limit(SAMPLE_SIZE)
-    .collect()
+RAW_TABLE   = "knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data"
+MARKER      = "@@LINK@@"                 # internal-only, never shown to the user/LLM
+PLACEHOLDER = "<System Of Interest>"      # fixed masking label — a constant BY DESIGN
+                                           # (per your pipeline diagram), not a data value.
+                                           # It never comes from a table because it isn't
+                                           # describing a document — it marks "a link was
+                                           # masked here". Change this ONE line to relabel
+                                           # it everywhere; it is never hardcoded elsewhere.
+MAX_SENT    = 600                         # hard cap on a "sentence" (guards huge bullet/table rows)
+
+
+def normalize_ref_col(c):
+    c = F.trim(c)
+    c = F.regexp_replace(c, r"^xwiki:", "")
+    c = F.regexp_replace(c, r"\s+", "")
+    return c
+
+
+# ══════════════════════════════════════════════════════════
+# STEP 1 — Build the {reference: title} dictionary
+#          FROM Cell 7's hyperlinks_df (your idea)
+#
+#   distinct target_reference values Cell 7 already found
+#   -> joined (only those) against the raw table
+#   -> collected into one small python dict
+#   -> broadcast to every executor
+#
+#   This is smaller and faster than scanning the whole raw table
+#   for titles no link ever points to.
+# ══════════════════════════════════════════════════════════
+needed_refs = (
+    hyperlinks_df
+    .select(normalize_ref_col(F.col("target_reference")).alias("target_reference"))
+    .distinct()
 )
 
-print(f"Sampling {len(sample_docs)} documents for ontology discovery\n")
+ver_w = Window.partitionBy("target_reference").orderBy(
+    F.col("content_update_date").desc_nulls_last()
+)
 
-# ----------------------------------------------------------
-# 2. Ask the LLM, per sampled document, what KINDS of entities
-#    and relationships actually appear — generic prompt, no
-#    domain assumptions baked in.
-# ----------------------------------------------------------
-DISCOVERY_PROMPT = """Read this document. Identify:
+title_lookup = (
+    spark.table(RAW_TABLE)
+    .select("reference", "title", "content_update_date")
+    .withColumn("target_reference", normalize_ref_col(F.col("reference")))
+    .join(needed_refs, on="target_reference", how="inner")   # only refs Cell 7 actually uses
+    .withColumn("_rk", F.row_number().over(ver_w))
+    .filter(F.col("_rk") == 1)                                 # latest version only
+    .select("target_reference", F.trim(F.col("title")).alias("title"))
+)
 
-1. DISTINCT KINDS of named things it mentions (categories, not the
-   specific names) — e.g. "named product/component", "named test
-   procedure", "named standard/regulation".
+# --- the dictionary itself ---
+hyperlink_title_dict = dict(title_lookup.collect())
+_dict_bc = spark.sparkContext.broadcast(hyperlink_title_dict)
 
-2. DISTINCT KINDS of relationships between those things, AS ACTUALLY
-   EXPRESSED in the text — e.g. "X is part of Y", "X is governed by Y",
-   "X identifies Y". Describe the relationship TYPE generically.
+print(f"Distinct link targets (Cell 7) : {needed_refs.count()}")
+print(f"Titles resolved into dictionary : {len(hyperlink_title_dict)}")
+print(f"Unresolved targets              : {needed_refs.count() - len(hyperlink_title_dict)}")
 
-Be specific to what THIS text actually contains. Do not guess
-categories that aren't evidenced here. Return at most 5 of each.
 
-Respond as JSON only, no other text:
-{{"entity_categories": ["...", "..."], "relation_categories": ["...", "..."]}}
+# ══════════════════════════════════════════════════════════
+# STEP 2 — SAME link pattern as Cell 7 (no second/rewritten regex)
+#          Cell 7's pieces, re-assembled with named groups so we
+#          can also capture the character offset per occurrence.
+# ══════════════════════════════════════════════════════════
+LINK_RE = re.compile(
+    r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?P<wiki>wiki:)?(?P<ref>[^>]+)>\]"
+)
 
-Document title: {title}
-Document text:
-{content}
-"""
-
-entity_votes = {}
-relation_votes = {}
-failures = 0
-
-for i, row in enumerate(sample_docs, 1):
-    prompt = DISCOVERY_PROMPT.format(
-        title=row["node_name"] or "",
-        content=(row["node_content"] or "")[:3000],
+# ---- drift guard --------------------------------------------------
+# Cell 7 defines FULL_MATCH and stays in the notebook's global scope.
+# If Cell 7's pattern is ever edited, this fails loudly instead of
+# Cell 8 silently extracting a different set of links than Cell 7 did.
+try:
+    _EXPECTED_FULL_MATCH = r"\[(?:[^<>\[\]]+?\s+)?<doc:(?:wiki:)?[^>]+>\]"
+    assert FULL_MATCH == _EXPECTED_FULL_MATCH, (
+        "Cell 7's FULL_MATCH has changed — Cell 8's LINK_RE must be "
+        "updated to match it, or the two cells will find different links."
     )
-    try:
-        response = llm.invoke([("human", prompt)])
-        text = response.content.strip().replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(text)
+    print("✅ Cell 8's link pattern still matches Cell 7's FULL_MATCH")
+except NameError:
+    print("⚠️  Cell 7 (FULL_MATCH) not found in scope — run Cell 7 before Cell 8.")
 
-        for cat in parsed.get("entity_categories", []):
-            key = cat.strip().lower()
-            if key:
-                entity_votes[key] = entity_votes.get(key, 0) + 1
+# A single \n is a LINE-WRAP, not a sentence end (your source text is
+# hard-wrapped at ~100 chars). Only real punctuation or a blank line
+# (paragraph break) ends a sentence.
+_LEFT_STOP  = re.compile(r"[.!?;:]|\n\s*\n")
+_RIGHT_STOP = re.compile(r"[.!?;]|\n\s*\n")
 
-        for cat in parsed.get("relation_categories", []):
-            key = cat.strip().lower()
-            if key:
-                relation_votes[key] = relation_votes.get(key, 0) + 1
+LINK_SCHEMA = ArrayType(StructType([
+    StructField("occurrence",       IntegerType()),
+    StructField("display_text",     StringType()),
+    StructField("link_type",        StringType()),
+    StructField("target_reference", StringType()),
+    StructField("sentence_marked",  StringType()),
+]))
 
-    except Exception as e:
-        failures += 1
-        print(f"  [{i}/{len(sample_docs)}] ⚠️  Failed on '{row['node_name']}': {e}")
 
-n_ok = len(sample_docs) - failures
-print(f"\n{n_ok}/{len(sample_docs)} documents processed successfully")
+def _sentence_bounds(text, s, e, spans):
+    """
+    `spans` = every link's (start, end) found in this document. Reference
+    ids often contain a literal '.' (e.g. Temp_Import.ed9bcae1-...WebHome) —
+    a stop character that falls INSIDE another link's span must be ignored,
+    or the boundary search slices a neighboring link in half.
+    """
+    def inside_any(pos):
+        return any(sp <= pos < ep for sp, ep in spans)
 
-# ----------------------------------------------------------
-# 3. Report — categories multiple INDEPENDENT documents
-#    surfaced are the real signal. Threshold scales loosely
-#    with sample size (not hardcoded to one corpus size).
-# ----------------------------------------------------------
-REPEAT_THRESHOLD = max(2, round(n_ok * 0.15))   # e.g. ~15% of successful docs, min 2
+    lo = max(0, s - MAX_SENT)
+    search_pos, last_stop = lo, None
+    while True:
+        m = _LEFT_STOP.search(text, search_pos, s)
+        if not m:
+            break
+        if not inside_any(m.start()):
+            last_stop = m
+        search_pos = m.end()
+    start = last_stop.end() if last_stop else lo
+
+    hi = min(len(text), e + MAX_SENT)
+    search_pos, end = e, hi
+    while True:
+        m = _RIGHT_STOP.search(text, search_pos, hi)
+        if not m:
+            break
+        if not inside_any(m.start()):
+            end = m.end()
+            break
+        search_pos = m.end()
+    return start, end
+
+
+def extract_and_replace(text):
+    """
+    Walk every link occurrence in `text`. For each occurrence, build
+    its sentence with:
+      - THIS link      -> MARKER   (swapped to <System Of Interest> in Spark)
+      - other links in the SAME sentence -> resolved <Title> from the
+        broadcast dictionary (built in Step 1), or [UNRESOLVED:ref] if
+        that target isn't in the dictionary. Never a guessed name.
+    """
+    if not text:
+        return []
+
+    matches = list(LINK_RE.finditer(text))
+    if not matches:
+        return []
+
+    spans  = [m.span() for m in matches]
+    lookup = _dict_bc.value
+
+    def norm(ref):
+        r = ref.strip()
+        r = re.sub(r"^xwiki:", "", r)
+        r = re.sub(r"\s+", "", r)
+        return r
+
+    parsed = [{
+        "span":  m.span(),
+        "label": (m.group("label") or "").strip(),
+        "ref":   m.group("ref").strip(),
+        "wiki":  bool(m.group("wiki")),
+        "title": lookup.get(norm(m.group("ref"))),
+    } for m in matches]
+
+    rows = []
+    for i, p in enumerate(parsed):
+        s, e = p["span"]
+        start, end = _sentence_bounds(text, s, e, spans)
+
+        pieces, cursor = [], start
+        for j, q in enumerate(parsed):
+            qs, qe = q["span"]
+            if qs < start or qe > end:
+                continue
+            pieces.append(text[cursor:qs])
+            if j == i:
+                pieces.append(MARKER)
+            elif q["title"]:
+                pieces.append(f"<{q['title']}>")
+            else:
+                pieces.append(f"[UNRESOLVED:{q['ref']}]")
+            cursor = qe
+        pieces.append(text[cursor:end])
+
+        sent = re.sub(r"\s+", " ", "".join(pieces)).strip()
+
+        rows.append((
+            i,
+            p["label"],
+            "doc:wiki" if p["wiki"] else "doc:Temp_Import",
+            p["ref"],
+            sent,
+        ))
+    return rows
+
+
+extract_udf = F.udf(extract_and_replace, LINK_SCHEMA)
+
+
+# ══════════════════════════════════════════════════════════
+# STEP 3 — Explode to one row per link OCCURRENCE, resolve THIS
+#          row's own title via the same dictionary (Spark-side join,
+#          equivalent lookup, keeps everything consistent).
+# ══════════════════════════════════════════════════════════
+links_with_context = (
+    knowledge_nodes
+    .select("source", "node_id", "node_name", "node_content")
+    .withColumn("_l", F.explode(extract_udf(F.col("node_content"))))
+    .select(
+        F.col("source"),
+        F.col("node_id").alias("source_node"),
+        F.col("node_name").alias("source_title"),           # SOURCE ENTITY
+        F.col("_l.occurrence").alias("occurrence"),
+        F.col("_l.display_text").alias("display_text"),
+        F.col("_l.link_type").alias("link_type"),
+        normalize_ref_col(F.col("_l.target_reference")).alias("target_reference"),
+        F.col("_l.sentence_marked").alias("sentence_marked"),
+    )
+).cache()
+
+n_occ = links_with_context.count()
+print()
+print(f"Link occurrences (Cell 8)      : {n_occ}")
+try:
+    print(f"Link total  (Cell 7)            : {total_links}   (delta = {n_occ - total_links})")
+except NameError:
+    pass
+
+sentences_df = (
+    links_with_context
+    .join(title_lookup, on="target_reference", how="left")
+    .withColumnRenamed("title", "target_title")             # TARGET ENTITY
+    .withColumn("is_resolved", F.col("target_title").isNotNull())
+
+    # <Title>  — blue-link style, readable form
+    .withColumn(
+        "sentence",
+        F.when(
+            F.col("is_resolved"),
+            F.expr("replace(sentence_marked, '@@LINK@@', concat('<', target_title, '>'))")
+        ).otherwise(
+            F.expr("replace(sentence_marked, '@@LINK@@', "
+                   "concat('[UNRESOLVED:', target_reference, ']'))")
+        )
+    )
+
+    # <System Of Interest> — masked form, feeds Cell 9's predicate extraction
+    .withColumn(
+        "sentence_masked",
+        F.expr(f"replace(sentence_marked, '@@LINK@@', '{PLACEHOLDER}')")
+    )
+
+    .withColumn(
+        "link_uid",
+        F.sha2(F.concat_ws("||", "source_node", "target_reference",
+                           F.col("occurrence").cast("string")), 256)
+    )
+
+    .select(
+        "link_uid", "source", "source_node", "source_title",
+        "target_reference", "target_title", "is_resolved",
+        "link_type", "occurrence", "sentence", "sentence_masked"
+    )
+).cache()
+
+
+# ══════════════════════════════════════════════════════════
+# STEP 4 — Diagnostics
+# ══════════════════════════════════════════════════════════
+n_total    = sentences_df.count()
+n_resolved = sentences_df.filter(F.col("is_resolved")).count()
+n_unresolved = n_total - n_resolved
+
+# Break down resolution rate BY link_type. doc:wiki: is XWiki's syntax for a
+# CROSS-WIKI reference -- it can legitimately point at a document that lives
+# outside this local wiki and was never pulled into knwbt_airr_foundry_dev_catalog.
+# doc:Temp_Import links are local imports, so they're expected to resolve at a
+# much higher rate. A gap here is expected behavior, not a bug -- this table
+# shows you the real numbers instead of a guess.
+print()
+print("Resolution rate by link_type (doc:wiki is expected to be lower):")
+display(
+    sentences_df
+    .groupBy("link_type")
+    .agg(
+        F.count("*").alias("total"),
+        F.sum(F.col("is_resolved").cast("int")).alias("resolved"),
+    )
+    .withColumn("resolved_pct", F.round(100 * F.col("resolved") / F.col("total"), 1))
+    .orderBy("link_type")
+)
 
 print()
 print("=" * 80)
-print(f"ENTITY CATEGORY VOTES  (repeat threshold: ≥{REPEAT_THRESHOLD} docs)")
+print("RESOLUTION SUMMARY")
 print("=" * 80)
-for cat, n in sorted(entity_votes.items(), key=lambda x: -x[1]):
-    flag = "✅ repeated" if n >= REPEAT_THRESHOLD else "⚠️  one-off"
-    print(f"  {n:2d}  {cat:50s} {flag}")
+print(f"Sentences (1 per link occurrence) : {n_total}")
+print(f"Title resolved via dictionary     : {n_resolved}")
+print(f"Unresolved (target not in table)  : {n_unresolved}"
+      f"  ({0 if not n_total else round(100 * n_unresolved / n_total, 1)}%)")
+
+if n_unresolved:
+    print()
+    print("Top unresolved targets:")
+    display(
+        sentences_df
+        .filter(~F.col("is_resolved"))
+        .groupBy("target_reference", "link_type")
+        .agg(F.count("*").alias("hits"))
+        .orderBy(F.desc("hits"))
+        .limit(20)
+    )
+
+print()
+print("Resolved sentences (source_title = Source Entity, target_title = Target Entity):")
+display(
+    sentences_df.select(
+        "source_title", "target_title", "link_type", "sentence", "sentence_masked"
+    )
+)
+
+
+# ══════════════════════════════════════════════════════════
+# STEP 5 — FULL DOCUMENT rendering (not per-sentence)
+#          Every <doc:...> link in the WHOLE document gets replaced
+#          with its resolved title, Wikipedia-blue-hyperlink style.
+#
+#   100% generic — works on ANY document, ANY number of links.
+#   Reuses the exact same LINK_RE and _dict_bc built above.
+#   NOTHING is hardcoded: title = _dict_bc.value.get(reference),
+#   same dictionary Step 1 built from Cell 7's own hyperlinks_df.
+#   Unresolved links are flagged in red, never guessed.
+# ══════════════════════════════════════════════════════════
+
+def _norm_py(ref):
+    r = ref.strip()
+    r = re.sub(r"^xwiki:", "", r)
+    r = re.sub(r"\s+", "", r)
+    return r
+
+
+def render_plain(text):
+    """Full document, every link -> <Resolved Title>. Generic replace."""
+    if not text:
+        return text
+    lookup = _dict_bc.value
+
+    def repl(m):
+        ref = _norm_py(m.group("ref"))
+        title = lookup.get(ref)
+        return f"<{title}>" if title else f"[UNRESOLVED:{ref}]"
+
+    out = LINK_RE.sub(repl, text)
+    out = re.sub(r"[ \t]*\n[ \t]*", " ", out)   # collapse hard line-wraps
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def render_html(text):
+    """Full document as HTML — every link -> a blue hyperlink span,
+    Wikipedia style. Generic: title text comes only from the
+    dictionary, nothing about any specific document is hardcoded."""
+    if not text:
+        return text
+    lookup = _dict_bc.value
+
+    def repl(m):
+        ref = _norm_py(m.group("ref"))
+        title = lookup.get(ref)
+        if title:
+            safe = title.replace("&", "&amp;").replace('"', "&quot;")
+            return (f'<a href="#{ref}" '
+                    f'style="color:#0645ad;text-decoration:none">{safe}</a>')
+        return f'<span style="color:#cc0000">[UNRESOLVED:{ref}]</span>'
+
+    out = LINK_RE.sub(repl, text)
+    out = re.sub(r"[ \t]*\n[ \t]*", " ", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return f'<p style="font-family:Georgia,serif;line-height:1.7">{out}</p>'
+
+
+render_plain_udf = F.udf(render_plain, StringType())
+render_html_udf  = F.udf(render_html,  StringType())
+
+document_rendered_df = (
+    knowledge_nodes
+    .select(
+        F.col("node_id").alias("source_node"),
+        F.col("node_name").alias("source_title"),
+        F.col("node_content"),
+    )
+    .withColumn("content_with_titles", render_plain_udf(F.col("node_content")))
+    .withColumn("content_html",        render_html_udf(F.col("node_content")))
+).cache()
 
 print()
 print("=" * 80)
-print(f"RELATION CATEGORY VOTES  (repeat threshold: ≥{REPEAT_THRESHOLD} docs)")
+print("FULL DOCUMENT RENDERING (Wikipedia-style blue hyperlinks)")
 print("=" * 80)
-for cat, n in sorted(relation_votes.items(), key=lambda x: -x[1]):
-    flag = "✅ repeated" if n >= REPEAT_THRESHOLD else "⚠️  one-off"
-    print(f"  {n:2d}  {cat:50s} {flag}")
-
-# ----------------------------------------------------------
-# Summary
-# ----------------------------------------------------------
-n_confirmed_entities  = sum(1 for n in entity_votes.values() if n >= REPEAT_THRESHOLD)
-n_confirmed_relations = sum(1 for n in relation_votes.values() if n >= REPEAT_THRESHOLD)
-
+print(f"Documents rendered : {document_rendered_df.count()}")
 print()
-print("=" * 80)
-print("NEXT STEP")
-print("=" * 80)
-print(f"{n_confirmed_entities} entity categories and {n_confirmed_relations} relation")
-print("categories crossed the repeat threshold. Review the ✅ rows above, merge")
-print("any near-duplicate phrasings, and lock them as ENTITY_TYPES/RELATION_TYPES")
-print("in Cell 9 (Pydantic schema). Count is whatever the evidence supports —")
-print("not chosen in advance.")
+display(document_rendered_df.select("source_title", "content_with_titles"))
+# To preview one document as real HTML in a notebook cell:
+#   displayHTML(document_rendered_df.filter(F.col("source_node") == "<id>")
+#                                    .select("content_html").first()[0])
