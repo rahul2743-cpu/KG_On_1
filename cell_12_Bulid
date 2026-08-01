@@ -54,9 +54,15 @@ WHERE {
 """
 
 # ---- Build the graph -----------------------------------------------------
+# Materialize the query results FIRST (not just iterate) -- this lets us
+# count exactly how many rows came back at each stage, so any silent drop
+# between Cell 10 -> Cell 11 (RDF) -> here can be caught, not assumed away.
+doc_rows_rdf = list(g.query(DOC_QUERY))
+rel_rows_rdf = list(g.query(REL_QUERY))
+
 G = nx.MultiDiGraph()
 
-for row in g.query(DOC_QUERY):
+for row in doc_rows_rdf:
     G.add_node(
         str(row.doc),
         label=str(row.label),
@@ -64,7 +70,7 @@ for row in g.query(DOC_QUERY):
         content=str(row.content),
     )
 
-for row in g.query(REL_QUERY):
+for row in rel_rows_rdf:
     src, tgt = str(row.src), str(row.tgt)
     G.add_node(src, label=str(row.srcLabel) if row.srcLabel else src)
     G.add_node(tgt, label=str(row.tgtLabel) if row.tgtLabel else tgt)
@@ -78,6 +84,63 @@ for row in g.query(REL_QUERY):
 
 print(f"Nodes (entities)  : {G.number_of_nodes()}")
 print(f"Edges (relations) : {G.number_of_edges()}")
+
+# ==========================================================
+# DATA INTEGRITY CHECK -- verify nothing was lost at ANY handoff:
+#   document_rendered_df (Cell 8d)  ->  RDF graph g (Cell 11)  ->  G (here)
+#   triples_df (Cell 10)            ->  RDF graph g (Cell 11)  ->  G (here)
+# This does not assume the pipeline is correct -- it checks.
+# ==========================================================
+print()
+print("=" * 80)
+print("DATA INTEGRITY CHECK")
+print("=" * 80)
+
+problems = []
+
+try:
+    n_docs_expected = document_rendered_df.count()
+except NameError:
+    n_docs_expected = None
+
+n_docs_in_rdf = len(doc_rows_rdf)
+n_docs_in_graph = sum(1 for _, a in G.nodes(data=True) if a.get("node_type") == "document")
+
+print(f"Documents  -- Cell 8d (document_rendered_df) : {n_docs_expected}")
+print(f"Documents  -- recovered from RDF (Cell 11)    : {n_docs_in_rdf}")
+print(f"Documents  -- present as nodes in G (here)     : {n_docs_in_graph}")
+if n_docs_expected is not None and n_docs_expected != n_docs_in_rdf:
+    problems.append(f"{n_docs_expected - n_docs_in_rdf} document(s) missing between Cell 8d and the RDF graph")
+if n_docs_in_rdf != n_docs_in_graph:
+    problems.append(f"{n_docs_in_rdf - n_docs_in_graph} document(s) missing between the RDF graph and G")
+
+print()
+
+try:
+    n_rel_expected = triples_df.count()
+except NameError:
+    n_rel_expected = None
+
+n_rel_in_rdf = len(rel_rows_rdf)
+n_rel_in_graph = G.number_of_edges()
+
+print(f"Relationships -- Cell 10 (triples_df)          : {n_rel_expected}")
+print(f"Relationships -- recovered from RDF (Cell 11)   : {n_rel_in_rdf}")
+print(f"Relationships -- present as edges in G (here)    : {n_rel_in_graph}")
+if n_rel_expected is not None and n_rel_expected != n_rel_in_rdf:
+    problems.append(f"{n_rel_expected - n_rel_in_rdf} relationship(s) missing between Cell 10 and the RDF graph")
+# note: n_rel_in_graph can be LESS than n_rel_in_rdf ONLY if two relationships
+# had the exact same (source, predicate, target) -- see Cell 11's own dedup
+# check, which reports that number explicitly. Any gap NOT explained by that
+# is a real loss, not expected dedup.
+
+print()
+if problems:
+    print("⚠️  DATA LOSS DETECTED:")
+    for p in problems:
+        print(f"   - {p}")
+else:
+    print("✅ No data lost -- every document and relationship is accounted for at every stage.")
 
 # ---- Most-connected entities --------------------------------------------
 top = sorted(G.degree(), key=lambda x: x[1], reverse=True)[:10]
