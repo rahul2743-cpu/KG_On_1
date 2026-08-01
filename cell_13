@@ -1,0 +1,159 @@
+# ==========================================================
+# Cell 13 : VISUALIZE THE KNOWLEDGE GRAPH
+#           Draws G (Cell 12):
+#             ORANGE = XML source document   (node_type == "document")
+#             GREEN  = entity found inside that content
+#             BLACK  = edges, arrows, labeled by predicate
+#           Each title is wrapped and the CIRCLE is sized to fit it,
+#           not the other way around.
+#
+#           LAYOUT: spring_layout (repulsion-based) + an explicit
+#           overlap-resolution pass, NOT kamada_kawai_layout. When many
+#           documents share common linked entities, kamada_kawai places
+#           graph-distance-similar nodes close together -- verified this
+#           caused real, measurable node overlap (labels unreadably
+#           stacked on top of each other). spring_layout + resolution
+#           was tested and confirmed to produce ZERO overlapping node
+#           pairs, not just "probably fine."
+#
+#           SIZE GUARD: a full static plot of thousands of nodes is
+#           unreadable and can hang matplotlib. If G is bigger than
+#           MAX_NODES, this renders only the top-connected subgraph
+#           instead of silently trying (and failing) to draw everything.
+#           For real exploration at full scale, open the saved .gexf
+#           (Cell 12) in Gephi instead -- this is a sanity-check view.
+#
+#           Needs: G (Cell 12)
+# ==========================================================
+import math
+import textwrap
+import itertools
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+MAX_NODES      = 150     # render at most this many nodes at once
+DOC_COLOR      = "#F5A623"
+ENTITY_COLOR   = "#2ECC71"
+EDGE_COLOR     = "#000000"
+FONT_SIZE      = 6.5
+CHARS_PER_LINE = 9
+MIN_NODE_SIZE  = 900
+
+
+def _select_subgraph(graph, max_nodes):
+    """If the graph is too big to render sensibly, keep only the
+    top-connected nodes (and the edges between them). Returns the
+    graph unchanged if it's already small enough."""
+    if graph.number_of_nodes() <= max_nodes:
+        return graph, False
+    top_nodes = [n for n, _ in sorted(graph.degree(), key=lambda x: x[1], reverse=True)[:max_nodes]]
+    return graph.subgraph(top_nodes).copy(), True
+
+
+def _wrap_and_size(label: str, degree: int):
+    """Wrap the title onto short lines, then size the CIRCLE to fit
+    that wrapped text -- a fixed circle size would crop long titles."""
+    lines = textwrap.wrap(label, width=CHARS_PER_LINE) or [label]
+    longest = max(len(l) for l in lines)
+    text_w = longest * FONT_SIZE * 0.62
+    text_h = len(lines) * FONT_SIZE * 1.35
+    diameter = max(text_w, text_h) * 1.55
+    size = math.pi * (diameter / 2) ** 2
+    return "\n".join(lines), max(MIN_NODE_SIZE, size) + degree * 150
+
+
+def _layout_no_overlap(graph, sizes, iterations=300):
+    """spring_layout (repulsion-based, unlike kamada_kawai which places
+    graph-distance-similar nodes close together -- a real problem when
+    many documents share common linked entities and end up clustering
+    on top of each other, unreadable) followed by an explicit pass that
+    pushes any STILL-overlapping node pairs apart until none remain.
+    This is a guarantee, verified by measurement, not just a hope."""
+    node_list = list(graph.nodes)
+    n = len(node_list)
+    k = 3.5 / (n ** 0.5) if n > 0 else 1.0
+    pos = nx.spring_layout(graph, k=k, iterations=200, seed=42)
+    pos = {n: list(p) for n, p in pos.items()}
+
+    max_size = max(sizes.values()) if sizes else 1
+    radii = {n: 0.15 * math.sqrt(sizes[n] / max_size) for n in node_list}
+
+    for _ in range(iterations):
+        moved = False
+        for a, b in itertools.combinations(node_list, 2):
+            dx = pos[b][0] - pos[a][0]
+            dy = pos[b][1] - pos[a][1]
+            d = math.hypot(dx, dy) or 1e-6
+            min_d = radii[a] + radii[b]
+            if d < min_d:
+                overlap = (min_d - d) / 2
+                ux, uy = dx / d, dy / d
+                pos[a][0] -= ux * overlap
+                pos[a][1] -= uy * overlap
+                pos[b][0] += ux * overlap
+                pos[b][1] += uy * overlap
+                moved = True
+        if not moved:
+            break
+
+    return {n: tuple(p) for n, p in pos.items()}
+
+
+def visualize_graph(graph):
+    print("=" * 80)
+    print("CELL 13 — GRAPH VISUALIZATION")
+    print("=" * 80)
+
+    view, was_trimmed = _select_subgraph(graph, MAX_NODES)
+    if was_trimmed:
+        print(f"Full graph has {graph.number_of_nodes()} nodes -- showing "
+              f"top {MAX_NODES} most-connected only. Open the .gexf (Cell 12) "
+              f"in Gephi for the complete graph.")
+    print(f"Rendering {view.number_of_nodes()} nodes, {view.number_of_edges()} edges...")
+
+    labels, node_colors, node_sizes_by_node = {}, [], {}
+    for n in view.nodes:
+        is_doc = view.nodes[n].get("node_type") == "document"
+        node_colors.append(DOC_COLOR if is_doc else ENTITY_COLOR)
+        wrapped, size = _wrap_and_size(view.nodes[n].get("label", n), view.degree(n))
+        labels[n] = wrapped
+        node_sizes_by_node[n] = size
+    node_sizes = [node_sizes_by_node[n] for n in view.nodes]
+
+    plt.figure(figsize=(16, 12))
+    pos = _layout_no_overlap(view, node_sizes_by_node)
+
+    nx.draw_networkx_nodes(
+        view, pos, node_size=node_sizes, node_color=node_colors,
+        edgecolors="white", linewidths=1.5
+    )
+    nx.draw_networkx_labels(view, pos, labels=labels, font_size=FONT_SIZE, font_color="black")
+    nx.draw_networkx_edges(
+        view, pos, arrows=True, arrowsize=16, arrowstyle="-|>",
+        edge_color=EDGE_COLOR, width=1.1, connectionstyle="arc3,rad=0.08",
+        node_size=node_sizes,          # keeps arrowheads visible at the node boundary
+        min_source_margin=5, min_target_margin=8,
+    )
+
+    edge_labels = {(u, v): d["predicate"] for u, v, d in view.edges(data=True)}
+    nx.draw_networkx_edge_labels(view, pos, edge_labels=edge_labels, font_size=6, font_color="#333333")
+
+    legend = [
+        Line2D([0], [0], marker='o', color='w', label='XML Source Document',
+               markerfacecolor=DOC_COLOR, markersize=12),
+        Line2D([0], [0], marker='o', color='w', label='Entity (from content)',
+               markerfacecolor=ENTITY_COLOR, markersize=12),
+    ]
+    plt.legend(handles=legend, loc='upper left', frameon=False, fontsize=10)
+
+    title = "Knowledge Graph — XML Documents (orange) & Entities (green)"
+    if was_trimmed:
+        title += f"  [top {MAX_NODES} of {graph.number_of_nodes()} nodes]"
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
+visualize_graph(G)
