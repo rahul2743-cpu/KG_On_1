@@ -1,72 +1,153 @@
 # ==========================================================
-# Cell 12 : Pydantic Extraction Models
-# Builds Literal[...] types DYNAMICALLY from whatever ontology
-# came out of Cell 11 — no hardcoded entity/relation names here.
+# Cell 11 : RDF TRIPLE GENERATION
+#           Converts triples_df (Cell 10) into an actual RDF graph:
+#               Source Entity --[Predicate]--> Target Entity
+#           using rdflib. Two things done so NOTHING is lost:
+#
+#           1. REIFICATION -- a plain RDF triple (s, p, o) has no room
+#              to carry relationship_description / relationship_strength
+#              / link_type. Standard RDF reification (a blank node
+#              describing the statement) is used to attach all of that,
+#              alongside the bare triple itself.
+#
+#           2. FULL DOCUMENT CONTENT -- content_with_titles (Cell 8d)
+#              is attached as a literal property on each source entity,
+#              so the underlying document text is preserved in the
+#              graph too, not just the extracted relationships.
+#
+#           URIs are built from source_node / target_reference (the
+#           real, stable, normalized document references) rather than
+#           titles -- titles are attached as rdfs:label for readability,
+#           but the identifier itself always traces back to the
+#           underlying knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data
+#           reference, so nothing is invented and nothing collides.
+#
+#           Needs: triples_df (Cell 10), document_rendered_df (Cell 8d)
+#           pip install rdflib   (add to Cell 0 if not already present)
 # ==========================================================
-from typing import Literal, List, Optional
-from pydantic import BaseModel, Field
+import re
+from urllib.parse import quote
+from rdflib import Graph, Namespace, URIRef, Literal, BNode, RDF, RDFS, XSD
 
 print("=" * 80)
-print("PYDANTIC EXTRACTION SCHEMA")
+print("CELL 11 — RDF TRIPLE GENERATION")
 print("=" * 80)
 
-# ----------------------------------------------------------
-# Pull the final category names out of Cell 11's ontology_proposal.
-# If that cell failed for any reason, fall back to reviewing
-# real_tags / real_hub_titles manually instead of guessing.
-# ----------------------------------------------------------
-if "ontology_proposal" in dir() and ontology_proposal:
-    ENTITY_NAMES   = [e["name"] for e in ontology_proposal["entity_types"]]
-    RELATION_NAMES = [r["name"] for r in ontology_proposal["relation_types"]]
-else:
-    raise RuntimeError(
-        "ontology_proposal not found — run Cell 11 successfully first, "
-        "or manually set ENTITY_NAMES / RELATION_NAMES before this cell."
-    )
-
-print(f"Entity types   ({len(ENTITY_NAMES)}): {ENTITY_NAMES}")
-print(f"Relation types ({len(RELATION_NAMES)}): {RELATION_NAMES}")
-
-# ----------------------------------------------------------
-# Dynamic Literal types — this is what makes it impossible for
-# the LLM to return a type outside the discovered ontology.
-# Literal[tuple(names)] is equivalent to Literal[name1, name2, ...]
-# ----------------------------------------------------------
-EntityTypeStr   = Literal[tuple(ENTITY_NAMES)]
-RelationTypeStr = Literal[tuple(RELATION_NAMES)]
-
-# ----------------------------------------------------------
-# Extraction models — same shape as the reference notebook's
-# ExtractedEntity / ExtractedRelationship / ExtractionResult
-# ----------------------------------------------------------
-class ExtractedEntity(BaseModel):
-    name: str = Field(description="Name of the entity, capitalized")
-    type: EntityTypeStr = Field(description="One of the allowed entity types")
-    description: str = Field(description="Brief description of the entity and its role")
+# ---- Namespaces ---------------------------------------------------------
+BASE      = "http://knwbt.local/kg/"
+ENTITY_NS = Namespace(BASE + "entity/")
+PRED_NS   = Namespace(BASE + "predicate/")
+EX        = Namespace(BASE + "schema/")   # our own metadata properties
 
 
-class ExtractedRelationship(BaseModel):
-    source: str = Field(description="Name of the source entity")
-    target: str = Field(description="Name of the target entity")
-    relation: RelationTypeStr = Field(description="One of the allowed relationship types")
-    description: str = Field(description="Sentence explaining why/how these entities relate")
+def _uri_safe(identifier: str) -> str:
+    """Make any reference/title safe to sit inside a URI path segment."""
+    return quote(identifier.strip(), safe="")
 
 
-class ExtractionResult(BaseModel):
-    entities: List[ExtractedEntity] = Field(default_factory=list)
-    relationships: List[ExtractedRelationship] = Field(default_factory=list)
+def entity_uri(reference_or_title: str) -> URIRef:
+    return URIRef(ENTITY_NS[_uri_safe(reference_or_title)])
 
+
+def predicate_uri(predicate: str) -> URIRef:
+    # predicate is already guaranteed snake_case by Cell 10 -> URI-safe as-is
+    return URIRef(PRED_NS[predicate])
+
+
+g = Graph()
+g.bind("ex", EX)
+g.bind("entity", ENTITY_NS)
+g.bind("predicate", PRED_NS)
+
+# ---- Step 1: attach FULL document content to each source entity --------
+# One entry per document, independent of how many relationships it has --
+# this is where content_with_titles (Cell 8d) gets preserved losslessly.
+doc_rows = document_rendered_df.select(
+    "source_node", "source_title", "content_with_titles"
+).collect()
+
+for d in doc_rows:
+    src_uri = entity_uri(d["source_node"])
+    g.add((src_uri, RDF.type, EX.Document))
+    g.add((src_uri, RDFS.label, Literal(d["source_title"])))
+    g.add((src_uri, EX.documentContent, Literal(d["content_with_titles"])))
+
+print(f"Documents with content attached : {len(doc_rows)}")
+
+# ---- Step 2: main triples + reified metadata ----------------------------
+triple_rows = triples_df.select(
+    "source_node", "source_title", "predicate",
+    "relationship_description", "relationship_strength",
+    "target_title", "target_reference", "link_type"
+).collect()
+
+for t in triple_rows:
+    src_uri  = entity_uri(t["source_node"])
+    tgt_uri  = entity_uri(t["target_reference"])
+    pred_uri = predicate_uri(t["predicate"])
+
+    # rdfs:label on both ends, and declare the predicate as an RDF property
+    g.add((src_uri, RDFS.label, Literal(t["source_title"])))
+    g.add((tgt_uri, RDF.type, EX.Entity))
+    g.add((tgt_uri, RDFS.label, Literal(t["target_title"])))
+    g.add((pred_uri, RDF.type, RDF.Property))
+    g.add((pred_uri, RDFS.label, Literal(t["predicate"].replace("_", " "))))
+
+    # ---- the actual RDF triple: Source Entity --[Predicate]--> Target Entity
+    g.add((src_uri, pred_uri, tgt_uri))
+
+    # ---- reification: describe THIS STATEMENT so no metadata is lost ----
+    stmt = BNode()
+    g.add((stmt, RDF.type, RDF.Statement))
+    g.add((stmt, RDF.subject, src_uri))
+    g.add((stmt, RDF.predicate, pred_uri))
+    g.add((stmt, RDF.object, tgt_uri))
+    g.add((stmt, EX.description, Literal(t["relationship_description"])))
+    g.add((stmt, EX.strength, Literal(t["relationship_strength"], datatype=XSD.integer)))
+    g.add((stmt, EX.linkType, Literal(t["link_type"])))
+    g.add((stmt, EX.sourceNode, Literal(t["source_node"])))
+    g.add((stmt, EX.targetReference, Literal(t["target_reference"])))
+
+print(f"Relationships (triples_df rows) : {len(triple_rows)}")
+print(f"Total RDF triples in graph      : {len(g)}")
+
+# ---- Duplicates across documents are automatically handled -------------
+# rdflib.Graph is a SET internally -- if two documents happen to produce
+# the exact same (subject, predicate, object) triple, it is stored ONCE,
+# not twice. Reified metadata (description/strength/etc) is NEVER
+# deduplicated though -- each relationship gets its own blank node, so
+# even an identical-looking relationship from a different document keeps
+# its own separate provenance. This line just makes that visible:
+n_main_triples_expected = len(triple_rows)          # 1 main triple per row, before dedup
+n_main_triples_actual = len({
+    (entity_uri(t["source_node"]), predicate_uri(t["predicate"]), entity_uri(t["target_reference"]))
+    for t in triple_rows
+})
+n_deduped = n_main_triples_expected - n_main_triples_actual
+print(f"Duplicate (source, predicate, target) triples merged : {n_deduped}")
+
+# ---- Serialize --------------------------------------------------------
+TTL_PATH = "/tmp/knowledge_graph.ttl"
+g.serialize(destination=TTL_PATH, format="turtle")
+print(f"\nSaved: {TTL_PATH}")
 
 print()
-print("✅ Schema built.")
-print(f"   ExtractedEntity.type       -> must be one of {ENTITY_NAMES}")
-print(f"   ExtractedRelationship.relation -> must be one of {RELATION_NAMES}")
+print("=" * 80)
+print("SAMPLE TURTLE OUTPUT (first 3 relationships)")
+print("=" * 80)
+sample_g = Graph()
+sample_g.bind("ex", EX)
+sample_g.bind("entity", ENTITY_NS)
+sample_g.bind("predicate", PRED_NS)
+for t in triple_rows[:3]:
+    src_uri  = entity_uri(t["source_node"])
+    tgt_uri  = entity_uri(t["target_reference"])
+    pred_uri = predicate_uri(t["predicate"])
+    sample_g.add((src_uri, pred_uri, tgt_uri))
+    sample_g.add((src_uri, RDFS.label, Literal(t["source_title"])))
+    sample_g.add((tgt_uri, RDFS.label, Literal(t["target_title"])))
+print(sample_g.serialize(format="turtle"))
 
-# ----------------------------------------------------------
-# Quick self-test: confirm invalid types are actually rejected
-# ----------------------------------------------------------
-try:
-    ExtractedEntity(name="Test", type="NOT_A_REAL_TYPE", description="should fail")
-    print("⚠️  WARNING: invalid type was NOT rejected — schema isn't enforcing correctly")
-except Exception:
-    print("✅ Confirmed: an invalid entity type IS rejected by the schema, as expected")
+print()
+print("Sample triples (Source Entity --[Predicate]--> Target Entity):")
+display(triples_df.select("source_title", "predicate", "target_title", "relationship_strength"))
