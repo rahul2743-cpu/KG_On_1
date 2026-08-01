@@ -1,0 +1,93 @@
+# ==========================================================
+# Cell 12 : BUILD NETWORKX GRAPH  (from the RDF graph, Cell 11)
+#           Reads the RDF graph `g` -- NOT triples_df directly -- so
+#           this stays true to the pipeline: RDF Triple -> NetworkX.
+#           A SPARQL query pulls each reified statement back out with
+#           all its metadata (description, strength, link_type) in
+#           one shot, plus the human-readable rdfs:label for every
+#           entity, plus the full document content for source nodes.
+#           Nothing added in Cell 11 is lost in this conversion.
+#
+#           Visualization is a SEPARATE step -- see Cell 13.
+#
+#           Needs: g (Cell 11)
+# ==========================================================
+import networkx as nx
+
+print("=" * 80)
+print("CELL 12 — BUILD NETWORKX KNOWLEDGE GRAPH")
+print("=" * 80)
+
+# ---- Step 1: pull every relationship + its metadata, one query ---------
+REL_QUERY = """
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX ex:   <http://knwbt.local/kg/schema/>
+
+SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+WHERE {
+    ?stmt a rdf:Statement ;
+          rdf:subject ?src ;
+          rdf:predicate ?pred ;
+          rdf:object ?tgt ;
+          ex:description ?description ;
+          ex:strength ?strength ;
+          ex:linkType ?linkType .
+    OPTIONAL { ?src rdfs:label ?srcLabel }
+    OPTIONAL { ?pred rdfs:label ?predLabel }
+    OPTIONAL { ?tgt rdfs:label ?tgtLabel }
+}
+"""
+
+# ---- Step 2: pull full document content for source entities ------------
+DOC_QUERY = """
+PREFIX ex:   <http://knwbt.local/kg/schema/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?doc ?label ?content
+WHERE {
+    ?doc a ex:Document ;
+         rdfs:label ?label ;
+         ex:documentContent ?content .
+}
+"""
+
+# ---- Build the graph -----------------------------------------------------
+G = nx.MultiDiGraph()
+
+for row in g.query(DOC_QUERY):
+    G.add_node(
+        str(row.doc),
+        label=str(row.label),
+        node_type="document",
+        content=str(row.content),
+    )
+
+for row in g.query(REL_QUERY):
+    src, tgt = str(row.src), str(row.tgt)
+    G.add_node(src, label=str(row.srcLabel) if row.srcLabel else src)
+    G.add_node(tgt, label=str(row.tgtLabel) if row.tgtLabel else tgt)
+    G.add_edge(
+        src, tgt,
+        predicate=str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1],
+        description=str(row.description),
+        strength=int(row.strength),
+        link_type=str(row.linkType),
+    )
+
+print(f"Nodes (entities)  : {G.number_of_nodes()}")
+print(f"Edges (relations) : {G.number_of_edges()}")
+
+# ---- Most-connected entities --------------------------------------------
+top = sorted(G.degree(), key=lambda x: x[1], reverse=True)[:10]
+print()
+print("Top 10 most-connected entities:")
+for node, deg in top:
+    label = G.nodes[node].get("label", node)
+    print(f"  {deg:3d}  {label}")
+
+# ---- Save (protects the LLM work in Cell 10 from being lost) -----------
+GRAPH_PATH = "/tmp/knowledge_graph.gexf"
+nx.write_gexf(G, GRAPH_PATH)
+print(f"\nSaved: {GRAPH_PATH}")
