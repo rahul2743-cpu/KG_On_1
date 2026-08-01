@@ -1,0 +1,83 @@
+# ==========================================================
+# Cell 8d : FULL DOCUMENT rendering (not per-sentence).
+#           Every <doc:...> link in the WHOLE document ->
+#           its resolved title, Wikipedia-blue-hyperlink style.
+#           Generic — works on any document. Reuses the same
+#           LINK_RE and hyperlink_title_dict from Cells 8a/8b, nothing hardcoded.
+#           Needs: knowledge_nodes (Cell 6), LINK_RE (Cell 8b),
+#                  hyperlink_title_dict (Cell 8a)
+# ==========================================================
+import re
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+
+print("=" * 80)
+print("CELL 8d — FULL DOCUMENT RENDERING (blue hyperlinks)")
+print("=" * 80)
+
+
+def _norm_py(ref):
+    r = ref.strip()
+    r = re.sub(r"^xwiki:", "", r)
+    r = re.sub(r"\s+", "", r)
+    return r
+
+
+def render_plain(text):
+    """Full document, every link -> <Resolved Title>."""
+    if not text:
+        return text
+    lookup = hyperlink_title_dict
+
+    def repl(m):
+        ref = _norm_py(m.group("ref"))
+        title = lookup.get(ref)
+        return f"<{title}>" if title else f"[UNRESOLVED:{ref}]"
+
+    out = LINK_RE.sub(repl, text)
+    out = re.sub(r"[ \t]*\n[ \t]*", " ", out)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def render_html(text):
+    """Full document as HTML — every link -> blue hyperlink span."""
+    if not text:
+        return text
+    lookup = hyperlink_title_dict
+
+    def repl(m):
+        ref = _norm_py(m.group("ref"))
+        title = lookup.get(ref)
+        if title:
+            safe = title.replace("&", "&amp;").replace('"', "&quot;")
+            return (f'<a href="#{ref}" '
+                    f'style="color:#0645ad;text-decoration:none">{safe}</a>')
+        return f'<span style="color:#cc0000">[UNRESOLVED:{ref}]</span>'
+
+    out = LINK_RE.sub(repl, text)
+    out = re.sub(r"[ \t]*\n[ \t]*", " ", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return f'<p style="font-family:Georgia,serif;line-height:1.7">{out}</p>'
+
+
+render_plain_udf = F.udf(render_plain, StringType())
+render_html_udf  = F.udf(render_html,  StringType())
+
+document_rendered_df = (
+    knowledge_nodes
+    .select(
+        F.col("node_id").alias("source_node"),
+        F.col("node_name").alias("source_title"),
+        F.col("node_content"),
+    )
+    .withColumn("content_with_titles", render_plain_udf(F.col("node_content")))
+    .withColumn("content_html",        render_html_udf(F.col("node_content")))
+).cache()
+
+print(f"Documents rendered : {document_rendered_df.count()}")
+print()
+display(document_rendered_df.select("source_title", "content_with_titles"))
+
+# To preview one document as real rendered HTML in a notebook cell:
+#   displayHTML(document_rendered_df.filter(F.col("source_node") == "<id>")
+#                                    .select("content_html").first()[0])
