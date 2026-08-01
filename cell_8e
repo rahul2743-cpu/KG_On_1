@@ -21,13 +21,15 @@ if DOC_TO_PREVIEW:
         print(f"No document found with source_node = {DOC_TO_PREVIEW!r}")
 
 # ---- Option 2: preview the FIRST N documents, one after another ----
-N = 5
-rows = (
-    document_rendered_df
-    .select("source_title", "content_html")
-    .limit(N)
-    .collect()
-)
+# Set N = None to show ALL documents in document_rendered_df, regardless
+# of how many that is (10 today, more later if your seed set grows).
+N = 10   # <- change this number, or set to None for "show everything"
+
+base_df = document_rendered_df.select("source_title", "content_html")
+rows = base_df.collect() if N is None else base_df.limit(N).collect()
+
+print(f"Documents available : {document_rendered_df.count()}")
+print(f"Documents shown      : {len(rows)}")
 
 blocks = "".join(
     f"<h3 style='margin-top:28px'>{r['source_title']}</h3>{r['content_html']}"
