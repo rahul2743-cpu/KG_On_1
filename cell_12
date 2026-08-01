@@ -1,129 +1,109 @@
-
-print(f"Content length: {len(test_row['node_content']) if test_row['node_content'] else 0} chars")
-print(test_row["node_content"])
-
 # ==========================================================
-# Cell 13 : Extraction Prompt + GraphRAGExtractor
-# This is where your LLM actually gets called per document.
+# Cell 12 : BUILD NETWORKX GRAPH  (from the RDF graph, Cell 11)
+#           Reads the RDF graph `g` -- NOT triples_df directly -- so
+#           this stays true to the pipeline: RDF Triple -> NetworkX.
+#           A SPARQL query pulls each reified statement back out with
+#           all its metadata (description, strength, link_type) in
+#           one shot, plus the human-readable rdfs:label for every
+#           entity, plus the full document content for source nodes.
+#           Nothing added in Cell 11 is lost in this conversion.
+#
+#           Needs: g (Cell 11)
 # ==========================================================
-from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, ArrayType, LongType
-import json
+import networkx as nx
+import matplotlib.pyplot as plt
 
 print("=" * 80)
-print("EXTRACTION PROMPT + EXTRACTOR")
+print("CELL 12 — NETWORKX KNOWLEDGE GRAPH")
 print("=" * 80)
 
-# ----------------------------------------------------------
-# 1. Build the extraction prompt DYNAMICALLY from Cell 12's
-#    ontology — no hardcoded types, same pattern the reference
-#    notebook uses (their Cell 9/10).
-# ----------------------------------------------------------
-entity_types_str   = ", ".join(ENTITY_NAMES)
-relation_types_str = ", ".join(RELATION_NAMES)
+# ---- Step 1: pull every relationship + its metadata, one query ---------
+REL_QUERY = """
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX ex:   <http://knwbt.local/kg/schema/>
 
-KG_EXTRACT_PROMPT = """-Goal-
-Given a Rolls-Royce engineering wiki document, identify all entities mentioned
-and their relationships.
-
-Extract up to {max_triplets} entity-relation triplets.
-
--Allowed Entity Types-
-{entity_types}
-
--Allowed Relationship Types-
-{relation_types}
-
--Steps-
-1. Identify ALL entities. For each entity extract:
-   - name: Name of the entity, capitalized
-   - type: One of the allowed entity types above
-   - description: A brief description of the entity and its role in this document
-
-2. Identify relationships between entities. For each pair extract:
-   - source: name of the source entity
-   - target: name of the target entity
-   - relation: one of the allowed relationship types above
-   - description: a sentence explaining why/how these entities are related
-
--Real Data-
-Document title: {title}
-######################
-{text}
-######################
+SELECT ?src ?srcLabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+WHERE {
+    ?stmt a rdf:Statement ;
+          rdf:subject ?src ;
+          rdf:predicate ?pred ;
+          rdf:object ?tgt ;
+          ex:description ?description ;
+          ex:strength ?strength ;
+          ex:linkType ?linkType .
+    OPTIONAL { ?src rdfs:label ?srcLabel }
+    OPTIONAL { ?pred rdfs:label ?predLabel }
+    OPTIONAL { ?tgt rdfs:label ?tgtLabel }
+}
 """
 
-print("✅ Prompt template ready (uses ontology from Cell 12)")
+# ---- Step 2: pull full document content for source entities ------------
+DOC_QUERY = """
+PREFIX ex:   <http://knwbt.local/kg/schema/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
-# ----------------------------------------------------------
-# 2. Structured LLM — forces output to match ExtractionResult
-#    (your `llm` is ChatOpenAI, which supports function-calling
-#    structured output via with_structured_output, same as
-#    Databricks/Anthropic clients)
-# ----------------------------------------------------------
-structured_llm = llm.with_structured_output(ExtractionResult)
+SELECT ?doc ?label ?content
+WHERE {
+    ?doc a ex:Document ;
+         rdfs:label ?label ;
+         ex:documentContent ?content .
+}
+"""
 
-MAX_PATHS_PER_CHUNK = 20   # cap triplets per document, controls cost/quality tradeoff
-MAX_CONTENT_CHARS   = 6000 # cap input length per call
+# ---- Build the graph -----------------------------------------------------
+G = nx.MultiDiGraph()
 
-# ----------------------------------------------------------
-# 3. The extractor function — ONE LLM call per document
-# ----------------------------------------------------------
-def extract_entities_relations(doc_id, title: str, content: str) -> dict:
-    """
-    Calls the LLM once for this document's content, constrained
-    to the ontology from Cell 12. Returns a plain dict (entities +
-    relationships), or an empty result on failure — never crashes
-    the caller.
-    """
-    if not content:
-        return {"doc_id": doc_id, "entities": [], "relationships": [], "error": None}
-
-    prompt = KG_EXTRACT_PROMPT.format(
-        max_triplets=MAX_PATHS_PER_CHUNK,
-        entity_types=entity_types_str,
-        relation_types=relation_types_str,
-        title=title or "",
-        text=content[:MAX_CONTENT_CHARS],
+for row in g.query(DOC_QUERY):
+    G.add_node(
+        str(row.doc),
+        label=str(row.label),
+        node_type="document",
+        content=str(row.content),
     )
 
-    try:
-        result: ExtractionResult = structured_llm.invoke(prompt)
-        return {
-            "doc_id": doc_id,
-            "entities": [e.model_dump() for e in result.entities],
-            "relationships": [r.model_dump() for r in result.relationships],
-            "error": None,
-        }
-    except Exception as e:
-        return {"doc_id": doc_id, "entities": [], "relationships": [], "error": str(e)}
+for row in g.query(REL_QUERY):
+    src, tgt = str(row.src), str(row.tgt)
+    G.add_node(src, label=str(row.srcLabel) if row.srcLabel else src)
+    G.add_node(tgt, label=str(row.tgtLabel) if row.tgtLabel else tgt)
+    G.add_edge(
+        src, tgt,
+        predicate=str(row.predLabel) if row.predLabel else str(row.pred).rsplit("/", 1)[-1],
+        description=str(row.description),
+        strength=int(row.strength),
+        link_type=str(row.linkType),
+    )
 
+print(f"Nodes (entities)  : {G.number_of_nodes()}")
+print(f"Edges (relations) : {G.number_of_edges()}")
 
-print("✅ extract_entities_relations() ready — no calls made yet, this is just the function")
+# ---- Most-connected entities --------------------------------------------
+top = sorted(G.degree(), key=lambda x: x[1], reverse=True)[:10]
+print()
+print("Top 10 most-connected entities:")
+for node, deg in top:
+    label = G.nodes[node].get("label", node)
+    print(f"  {deg:3d}  {label}")
 
-# ----------------------------------------------------------
-# 4. Smoke test — ONE real call, on ONE document, to confirm
-#    the whole chain (prompt → LLM → Pydantic parsing) works
-#    before running it across the full corpus.
-# ----------------------------------------------------------
-test_row = knowledge_nodes.select("doc_id", "node_name", "node_content").limit(1).collect()[0]
+# ---- Visual ---------------------------------------------------------------
+plt.figure(figsize=(14, 10))
+pos = nx.spring_layout(G, k=0.9, seed=42)
+labels = {n: G.nodes[n].get("label", n) for n in G.nodes}
 
-print(f"\nSmoke test on doc_id={test_row['doc_id']} ('{test_row['node_name']}')...")
-test_result = extract_entities_relations(
-    test_row["doc_id"], test_row["node_name"], test_row["node_content"]
-)
+nx.draw_networkx_nodes(G, pos, node_size=1200, node_color="#a6cee3")
+nx.draw_networkx_labels(G, pos, labels=labels, font_size=7)
+nx.draw_networkx_edges(G, pos, arrows=True, arrowsize=12, edge_color="#888888")
 
-if test_result["error"]:
-    print(f"❌ Extraction failed: {test_result['error']}")
-else:
-    print(f"✅ Extracted {len(test_result['entities'])} entities, "
-          f"{len(test_result['relationships'])} relationships")
-    print()
-    print("Entities:")
-    for e in test_result["entities"]:
-        print(f"  [{e['type']}] {e['name']} — {e['description']}")
-    print()
-    print("Relationships:")
-    for r in test_result["relationships"]:
-        print(f"  {r['source']} --{r['relation']}--> {r['target']}")
-        print(f"    {r['description']}")
+edge_labels = {(u, v): d["predicate"] for u, v, d in G.edges(data=True)}
+nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6)
+
+plt.title("Knowledge Graph — Entities & Relations (from RDF)")
+plt.axis("off")
+plt.tight_layout()
+plt.show()
+
+# ---- Save for downstream use (RAG graph, sharing, etc.) ------------------
+GRAPH_PATH = "/tmp/knowledge_graph.gexf"
+nx.write_gexf(G, GRAPH_PATH)
+print(f"\nSaved: {GRAPH_PATH}")
