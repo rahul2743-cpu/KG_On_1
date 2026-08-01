@@ -15,18 +15,21 @@
 #              so the underlying document text is preserved in the
 #              graph too, not just the extracted relationships.
 #
-#           URIs are built from source_node / target_reference (the
-#           real, stable, normalized document references) rather than
-#           titles -- titles are attached as rdfs:label for readability,
-#           but the identifier itself always traces back to the
-#           underlying knwbt_airr_foundry_dev_catalog.secured.knowbot_raw_data
-#           reference, so nothing is invented and nothing collides.
+#           ENTITY URIs are built from the READABLE TITLE (not the raw
+#           GUID-style reference, e.g. NOT
+#           "Temp_Import.00257070-2352-11f1-8720-005056902ed8.WebHome").
+#           A short hash suffix from the reference is appended ONLY to
+#           guarantee two different documents can never collide even if
+#           they happen to share the exact same title -- the reference
+#           itself is still preserved as a property (ex:sourceReference /
+#           ex:targetReference on the reified statement), so nothing is
+#           lost, it's just not what the URI is built from anymore.
 #
 #           Needs: triples_df (Cell 10), document_rendered_df (Cell 8d)
 #           pip install rdflib   (add to Cell 0 if not already present)
 # ==========================================================
 import re
-from urllib.parse import quote
+import hashlib
 from rdflib import Graph, Namespace, URIRef, Literal, BNode, RDF, RDFS, XSD
 
 print("=" * 80)
@@ -40,13 +43,21 @@ PRED_NS   = Namespace(BASE + "predicate/")
 EX        = Namespace(BASE + "schema/")   # our own metadata properties
 
 
-def _uri_safe(identifier: str) -> str:
-    """Make any reference/title safe to sit inside a URI path segment."""
-    return quote(identifier.strip(), safe="")
+def _slugify(title: str) -> str:
+    """Human-readable, e.g. 'TEDS - HOW TO Manage Test Environments'
+    -> 'TEDS_HOW_TO_Manage_Test_Environments'."""
+    s = re.sub(r"[^\w\s-]", "", title.strip())
+    s = re.sub(r"[\s-]+", "_", s)
+    return s.strip("_") or "unknown"
 
 
-def entity_uri(reference_or_title: str) -> URIRef:
-    return URIRef(ENTITY_NS[_uri_safe(reference_or_title)])
+def entity_uri(title: str, reference: str) -> URIRef:
+    """Readable slug from the TITLE + an 8-char hash of the reference,
+    so two entities with the SAME title (rare, but possible) never
+    collide into one node. The reference is never lost -- it's still
+    stored as ex:sourceReference / ex:targetReference below."""
+    short_hash = hashlib.md5(reference.encode()).hexdigest()[:8]
+    return URIRef(ENTITY_NS[f"{_slugify(title)}_{short_hash}"])
 
 
 def predicate_uri(predicate: str) -> URIRef:
@@ -67,9 +78,10 @@ doc_rows = document_rendered_df.select(
 ).collect()
 
 for d in doc_rows:
-    src_uri = entity_uri(d["source_node"])
+    src_uri = entity_uri(d["source_title"], d["source_node"])
     g.add((src_uri, RDF.type, EX.Document))
     g.add((src_uri, RDFS.label, Literal(d["source_title"])))
+    g.add((src_uri, EX.sourceReference, Literal(d["source_node"])))
     g.add((src_uri, EX.documentContent, Literal(d["content_with_titles"])))
 
 print(f"Documents with content attached : {len(doc_rows)}")
@@ -82,14 +94,15 @@ triple_rows = triples_df.select(
 ).collect()
 
 for t in triple_rows:
-    src_uri  = entity_uri(t["source_node"])
-    tgt_uri  = entity_uri(t["target_reference"])
+    src_uri  = entity_uri(t["source_title"], t["source_node"])
+    tgt_uri  = entity_uri(t["target_title"], t["target_reference"])
     pred_uri = predicate_uri(t["predicate"])
 
     # rdfs:label on both ends, and declare the predicate as an RDF property
     g.add((src_uri, RDFS.label, Literal(t["source_title"])))
     g.add((tgt_uri, RDF.type, EX.Entity))
     g.add((tgt_uri, RDFS.label, Literal(t["target_title"])))
+    g.add((tgt_uri, EX.targetReference, Literal(t["target_reference"])))
     g.add((pred_uri, RDF.type, RDF.Property))
     g.add((pred_uri, RDFS.label, Literal(t["predicate"].replace("_", " "))))
 
@@ -105,48 +118,25 @@ for t in triple_rows:
     g.add((stmt, EX.description, Literal(t["relationship_description"])))
     g.add((stmt, EX.strength, Literal(t["relationship_strength"], datatype=XSD.integer)))
     g.add((stmt, EX.linkType, Literal(t["link_type"])))
-    g.add((stmt, EX.sourceNode, Literal(t["source_node"])))
+    g.add((stmt, EX.sourceReference, Literal(t["source_node"])))
     g.add((stmt, EX.targetReference, Literal(t["target_reference"])))
 
 print(f"Relationships (triples_df rows) : {len(triple_rows)}")
 print(f"Total RDF triples in graph      : {len(g)}")
 
-# ---- Duplicates across documents are automatically handled -------------
-# rdflib.Graph is a SET internally -- if two documents happen to produce
-# the exact same (subject, predicate, object) triple, it is stored ONCE,
-# not twice. Reified metadata (description/strength/etc) is NEVER
-# deduplicated though -- each relationship gets its own blank node, so
-# even an identical-looking relationship from a different document keeps
-# its own separate provenance. This line just makes that visible:
-n_main_triples_expected = len(triple_rows)          # 1 main triple per row, before dedup
-n_main_triples_actual = len({
-    (entity_uri(t["source_node"]), predicate_uri(t["predicate"]), entity_uri(t["target_reference"]))
+# rdflib.Graph is a SET -- if two documents produce the exact same
+# (subject, predicate, object), it's stored once, not twice. Duplicate
+# hyperlinks across your XML files are expected and handled automatically;
+# reified metadata (description/strength) is kept separately per
+# relationship regardless, so no provenance is ever lost.
+n_expected = len(triple_rows)
+n_actual = len({
+    (entity_uri(t["source_title"], t["source_node"]),
+     predicate_uri(t["predicate"]),
+     entity_uri(t["target_title"], t["target_reference"]))
     for t in triple_rows
 })
-n_deduped = n_main_triples_expected - n_main_triples_actual
-print(f"Duplicate (source, predicate, target) triples merged : {n_deduped}")
-
-# ---- Serialize --------------------------------------------------------
-TTL_PATH = "/tmp/knowledge_graph.ttl"
-g.serialize(destination=TTL_PATH, format="turtle")
-print(f"\nSaved: {TTL_PATH}")
-
-print()
-print("=" * 80)
-print("SAMPLE TURTLE OUTPUT (first 3 relationships)")
-print("=" * 80)
-sample_g = Graph()
-sample_g.bind("ex", EX)
-sample_g.bind("entity", ENTITY_NS)
-sample_g.bind("predicate", PRED_NS)
-for t in triple_rows[:3]:
-    src_uri  = entity_uri(t["source_node"])
-    tgt_uri  = entity_uri(t["target_reference"])
-    pred_uri = predicate_uri(t["predicate"])
-    sample_g.add((src_uri, pred_uri, tgt_uri))
-    sample_g.add((src_uri, RDFS.label, Literal(t["source_title"])))
-    sample_g.add((tgt_uri, RDFS.label, Literal(t["target_title"])))
-print(sample_g.serialize(format="turtle"))
+print(f"Duplicate (source, predicate, target) triples merged : {n_expected - n_actual}")
 
 print()
 print("Sample triples (Source Entity --[Predicate]--> Target Entity):")
