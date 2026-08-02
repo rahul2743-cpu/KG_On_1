@@ -178,3 +178,77 @@ if total_chips > 0:
             how="left_anti"
         ).distinct().limit(20)
     )
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# ==========================================================
+# Stage 4 : Knowledge Node Creation
+# Cell 6 : Create One Node per XML  (deterministic + normalized)
+# ==========================================================
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+print("=" * 80)
+print("KNOWLEDGE NODE CREATION")
+print("=" * 80)
+node_df = xml_df
+print(f"XML Documents (clean) : {node_df.count()}")
+def normalize_ref_col(c):
+    c = F.trim(c)
+    c = F.regexp_replace(c, r"^xwiki:", "")
+    c = F.regexp_replace(c, r"\s+", " ")
+    return F.trim(c)
+base = (
+    node_df
+    .select(
+        F.col("doc_id"),
+        F.col("source"),
+        F.col("reference").alias("node_id"),
+        F.col("title").alias("node_name"),
+        F.col("content_clean").alias("node_content"),
+        F.col("content_raw").alias("node_content_raw"),
+    )
+    .withColumn("node_id", normalize_ref_col(F.col("node_id")))
+    .withColumn("content_len", F.length(F.coalesce(F.col("node_content"), F.lit(""))))
+)
+base = base.withColumn(
+    "node_id",
+    F.when(
+        F.col("node_id").isNull() | (F.length(F.col("node_id")) == 0),
+        F.concat(F.lit("__no_ref__doc_"), F.col("doc_id").cast("string"))
+    ).otherwise(F.col("node_id"))
+)
+w = (
+    Window.partitionBy("node_id")
+    .orderBy(F.col("content_len").desc_nulls_last(), F.col("doc_id").asc())
+)
+knowledge_nodes = (
+    base
+    .withColumn("_rk", F.row_number().over(w))
+    .filter(F.col("_rk") == 1)
+    .drop("_rk")
+    .withColumn("has_content", F.col("content_len") > 0)
+).cache()
+total_nodes    = knowledge_nodes.count()
+n_with_content = knowledge_nodes.filter(F.col("has_content")).count()
+n_stub         = total_nodes - n_with_content
+n_collisions   = base.count() - total_nodes
+print()
+print("=" * 80)
+print("KNOWLEDGE NODES")
+print("=" * 80)
+print(f"Total Nodes Created  : {total_nodes}")
+print(f"With Content         : {n_with_content}")
+print(f"Stub / Empty         : {n_stub}")
+if n_collisions > 0:
+    print(f"⚠️  {n_collisions} doc(s) collapsed due to duplicate node_id (reference)")
+check = (
+    knowledge_nodes.alias("n")
+    .join(xml_df.select("doc_id", "content_clean").alias("x"), on="doc_id", how="inner")
+    .filter(~F.col("n.node_content").eqNullSafe(F.col("x.content_clean")))
+)
+n_mismatch = check.count()
+print(f"\n🔎 node_content vs content_clean mismatch count : {n_mismatch}")
+if n_mismatch > 0:
+    print("⚠️  MISMATCH DETECTED — rerun Cell 5 fully, then rerun Cell 6.")
+print()
+display(knowledge_nodes.select("doc_id", "source", "node_id", "node_name", "node_content"))
