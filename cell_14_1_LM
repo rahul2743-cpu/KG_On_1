@@ -1,0 +1,509 @@
+# ==========================================================
+# Cell 14 : GRAPH COMMUNITIES -> COMMUNITY NAMES
+#           Takes the community PARTITION of G and gives every
+#           community a human-readable NAME (+ one-line description),
+#           following the GraphRAG paper:
+#             - Section 3.1.4  Knowledge Graph -> Graph Communities
+#             - Section 3.1.5  the report TITLE rule: "community's name
+#               that represents its key entities - short but specific.
+#               When possible, include representative named entities."
+#
+#           This cell does TWO things, in this order:
+#             1. COMMUNITY PART -- groups the nodes of G into
+#                communities at EVERY level of the hierarchy
+#                (level 0 = coarsest root communities, deeper levels =
+#                sub-communities), using community_path.
+#             2. NAMING PART -- asks the LLM for a short title for each
+#                community, given its member entities and the strongest
+#                relationships INSIDE that community.
+#
+#           Reuse, not duplication: if Cell 17 (hierarchical Leiden)
+#           has already tagged G, that partition is used as-is. If it
+#           has NOT, this cell runs the same recursive Leiden itself so
+#           it still works standalone. It never re-partitions a graph
+#           that is already partitioned -- that would silently change
+#           the community IDs Cell 17 printed.
+#
+#           Element prioritisation inside each community follows the
+#           paper (3.1.5): edges are ranked by combined source+target
+#           node degree (overall prominence), and the prompt is filled
+#           from the top down until the caps below are reached -- so a
+#           1,000-node community produces a prompt of the same size as
+#           a 20-node one, and the important entities are the ones that
+#           survive the cut.
+#
+#           Needs: G (Cell 12).
+#           Optional: community_path on G's nodes (Cell 17),
+#                     driver_llm (Cell 10b) -- rebuilt here if absent.
+# ==========================================================
+import json
+import re
+from collections import defaultdict
+
+import networkx as nx
+
+print("=" * 80)
+print("CELL 14 — GRAPH COMMUNITIES -> COMMUNITY NAMES")
+print("=" * 80)
+
+# ---- Tunable constants, exposed explicitly (not buried in code) --------
+# None of these come from the paper -- they are cost/latency controls.
+LEVELS_TO_NAME        = None   # None = name communities at EVERY level.
+                               # e.g. [0] = only root communities (cheapest).
+MIN_COMMUNITY_SIZE_TO_NAME = 2 # a 1-node "community" is just that entity;
+                               # it gets its own label as its name, no LLM call
+MAX_COMMUNITIES_TO_NAME = 200  # hard budget on LLM calls. Communities beyond
+                               # this (smallest first) keep the deterministic
+                               # fallback name -- they are NOT dropped.
+MAX_ENTITIES_IN_PROMPT  = 30   # per-community prompt caps (context control)
+MAX_EDGES_IN_PROMPT     = 30
+MAX_DESC_CHARS          = 160  # truncate long relationship descriptions
+NAME_MAX_WORDS          = 8    # a "name", not a sentence
+
+# ---- Step 0: guards -----------------------------------------------------
+try:
+    G
+except NameError:
+    raise RuntimeError("G not found — run Cell 12 (BUILD NETWORKX GRAPH) first.")
+
+if G.number_of_nodes() == 0:
+    raise RuntimeError("G has zero nodes — nothing to group or name. Check Cell 12.")
+
+
+def _label(n):
+    """Human-readable label for a node, falling back to the URI itself."""
+    return G.nodes[n].get("label", n)
+
+
+# ---- Step 1: undirected projection (reused from Cell 17 if present) -----
+# Same construction as Cell 17: parallel edges MERGED by summing strength.
+# Rebuilt here only if Cell 17 wasn't run, so this cell is standalone.
+try:
+    G_simple
+    print("Undirected projection : reused from Cell 17")
+except NameError:
+    G_simple = nx.Graph()
+    G_simple.add_nodes_from(G.nodes(data=True))
+    for _u, _v, _d in G.edges(data=True):
+        _w = _d.get("strength", 1)
+        if G_simple.has_edge(_u, _v):
+            G_simple[_u][_v]["weight"] += _w
+        else:
+            G_simple.add_edge(_u, _v, weight=_w)
+    print("Undirected projection : built here (Cell 17 not run)")
+
+print(f"Graph : {G.number_of_nodes()} nodes, {G.number_of_edges()} directed edges")
+
+# ---- Step 2: THE COMMUNITY PART -- make sure G is partitioned -----------
+# If Cell 17 already tagged the nodes, that partition is authoritative and
+# is used unchanged. Otherwise the same recursive Leiden is run here.
+already_tagged = sum(1 for _, a in G.nodes(data=True) if a.get("community_path"))
+
+if already_tagged == G.number_of_nodes():
+    print(f"Partition : reusing Cell 17's ({already_tagged}/{G.number_of_nodes()} nodes tagged)")
+else:
+    print(f"Partition : only {already_tagged}/{G.number_of_nodes()} nodes tagged — running Leiden here")
+    import igraph as ig
+    import leidenalg
+
+    LEIDEN_SEED        = 42
+    LEIDEN_RESOLUTION  = 1.0
+    RESOLUTION_GROWTH  = 1.3
+    MAX_DEPTH          = 3
+    MIN_COMMUNITY_SIZE = 4
+
+    def _leiden_partition(nodes, resolution):
+        sub = G_simple.subgraph(nodes)
+        node_list = list(sub.nodes())
+        if len(node_list) <= 1:
+            return [node_list]
+        edge_list = list(sub.edges())
+        if not edge_list:
+            return [[n] for n in node_list]
+        node_index = {n: i for i, n in enumerate(node_list)}
+        ig_sub = ig.Graph(n=len(node_list),
+                          edges=[(node_index[u], node_index[v]) for u, v in edge_list])
+        ig_sub.es["weight"] = [sub[u][v].get("weight", 1) for u, v in edge_list]
+        part = leidenalg.find_partition(
+            ig_sub, leidenalg.RBConfigurationVertexPartition,
+            weights="weight", resolution_parameter=resolution, seed=LEIDEN_SEED,
+        )
+        return [[node_list[i] for i in community] for community in part]
+
+    paths = {}
+
+    def _recurse(nodes, depth, resolution, current_path):
+        if len(nodes) < MIN_COMMUNITY_SIZE or depth >= MAX_DEPTH:
+            for n in nodes:
+                paths[n] = current_path if current_path else [0]
+            return
+        communities = _leiden_partition(nodes, resolution)
+        if len(communities) <= 1:
+            for n in nodes:
+                paths[n] = current_path if current_path else [0]
+            return
+        for community_id, members in enumerate(communities):
+            _recurse(members, depth + 1, resolution * RESOLUTION_GROWTH,
+                     current_path + [community_id])
+
+    _recurse(list(G_simple.nodes()), 0, LEIDEN_RESOLUTION, [])
+
+    for n, p in paths.items():
+        G.nodes[n]["community_path"]   = ".".join(str(x) for x in p)
+        G.nodes[n]["community_level"]  = len(p)
+        G.nodes[n]["community_id"]     = p[-1]      # last segment only, NOT unique
+        G.nodes[n]["community_id_top"] = p[0]
+    print(f"Partition : built here, {len(paths)} nodes tagged")
+
+# ---- Step 3: group nodes into communities, at every level ---------------
+# A path "0.2.1" belongs to community "0" at level 0, "0.2" at level 1 and
+# "0.2.1" at level 2. Branches that stopped early are represented by their
+# own short path at deeper levels too (natural truncation, same rule as
+# Cell 17) -- that is the paper's "projected downwards" behaviour.
+communities = defaultdict(list)          # (level, path_str) -> [node, ...]
+
+max_level = max(len(G.nodes[n]["community_path"].split(".")) for n in G.nodes())
+
+for n in G.nodes():
+    segments = G.nodes[n]["community_path"].split(".")
+    for level in range(max_level):
+        prefix = ".".join(segments[:level + 1])   # short paths truncate to themselves
+        communities[(level, prefix)].append(n)
+
+print()
+print(f"Hierarchy depth : {max_level} levels")
+for level in range(max_level):
+    at_level = [k for k in communities if k[0] == level]
+    sizes = [len(communities[k]) for k in at_level]
+    print(f"  Level {level}: {len(at_level):4d} communities   "
+          f"(largest {max(sizes)} nodes, smallest {min(sizes)} nodes)")
+
+if LEVELS_TO_NAME is not None:
+    communities = {k: v for k, v in communities.items() if k[0] in LEVELS_TO_NAME}
+    print(f"\nNaming restricted to level(s) {LEVELS_TO_NAME} -> {len(communities)} communities")
+
+# ---- Step 4: build the naming context for one community ----------------
+# Paper (3.1.5) prioritisation: for each community edge in DECREASING order
+# of combined source+target node degree, add the source node, target node
+# and the edge description -- until the budget is spent.
+def _community_context(nodes):
+    node_set = set(nodes)
+    deg = {n: G_simple.degree(n) if n in G_simple else 0 for n in nodes}
+
+    internal_edges = []
+    for u, v, d in G.edges(data=True):
+        if u in node_set and v in node_set:
+            internal_edges.append((deg.get(u, 0) + deg.get(v, 0), u, v, d))
+    internal_edges.sort(key=lambda x: x[0], reverse=True)
+
+    top_entities = sorted(nodes, key=lambda n: deg.get(n, 0), reverse=True)[:MAX_ENTITIES_IN_PROMPT]
+
+    entity_lines = []
+    for n in top_entities:
+        cls = G.nodes[n].get("class_name") or G.nodes[n].get("node_type") or "Unclassified"
+        entity_lines.append(f"- {_label(n)} ({cls}, degree {deg.get(n, 0)})")
+
+    rel_lines = []
+    for _, u, v, d in internal_edges[:MAX_EDGES_IN_PROMPT]:
+        desc = (d.get("description") or "").strip().replace("\n", " ")
+        if len(desc) > MAX_DESC_CHARS:
+            desc = desc[:MAX_DESC_CHARS].rstrip() + "…"
+        pred = d.get("predicate", "related_to")
+        rel_lines.append(f"- {_label(u)} --[{pred}]--> {_label(v)}" + (f" : {desc}" if desc else ""))
+
+    return top_entities, entity_lines, rel_lines
+
+
+def _fallback_name(nodes, top_entities):
+    """Deterministic name used when the LLM is unavailable, over budget,
+    or returns something unusable. Never a placeholder like 'Community 3'
+    -- it always says what the community is actually about."""
+    heads = [_label(n) for n in top_entities[:2]] or [_label(n) for n in nodes[:2]]
+    base = " & ".join(heads)
+    return (base[:70] + "…") if len(base) > 70 else base
+
+
+# ---- Step 5: the LLM namer ---------------------------------------------
+NAME_SYSTEM_PROMPT = f"""You name clusters of entities extracted from a systems-engineering wiki knowledge graph.
+
+You are given the entities in ONE community and the strongest relationships between them.
+
+Return a JSON object, and nothing else:
+{{"name": "<short title>", "description": "<one sentence>"}}
+
+Rules for "name":
+- At most {NAME_MAX_WORDS} words. Title Case. No trailing punctuation.
+- Short but SPECIFIC: it must say what THIS community is about, so that it
+  is distinguishable from other communities in the same graph.
+- Include the representative named entities when they are what the community
+  is actually about (e.g. "UltraFan Power Gearbox Vibration").
+- Do NOT output generic filler like "Community 3", "Miscellaneous Entities",
+  "Various Topics", or "Knowledge Graph Cluster".
+
+Rules for "description":
+- ONE sentence describing what ties these entities together.
+- Only what the given entities and relationships support. Do not invent facts.
+
+No preamble, no markdown fences, no explanation. JSON only."""
+
+
+def _get_llm():
+    """driver_llm from Cell 10b if it exists, otherwise built here with the
+    same config. Returns None if credentials aren't available -- naming then
+    falls back to deterministic names instead of failing the whole cell."""
+    try:
+        return driver_llm
+    except NameError:
+        pass
+    try:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=DEPLOYMENT_NAME,
+            base_url="https://adb-3955688708870984.4.azuredatabricks.net/serving-endpoints",
+            api_key=DATABRICKS_TOKEN,
+            temperature=0,
+        )
+    except Exception as e:
+        print(f"⚠️  No LLM available ({e}) — using deterministic names only.")
+        return None
+
+
+_llm = _get_llm()
+
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _llm_name(entity_lines, rel_lines):
+    """Returns (name, description) or (None, None) on any failure. One bad
+    community must never kill the run -- same error policy as Cell 10."""
+    if _llm is None:
+        return None, None
+
+    user_prompt = (
+        "Entities in this community:\n" + "\n".join(entity_lines) +
+        "\n\nRelationships inside this community:\n" +
+        ("\n".join(rel_lines) if rel_lines else "- (no relationships between these entities)")
+    )
+    try:
+        resp = _llm.invoke([
+            {"role": "system", "content": NAME_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ])
+        raw = resp.content.strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        match = _JSON_RE.search(raw)
+        if not match:
+            return None, None
+        data = json.loads(match.group(0))
+        name = str(data.get("name", "")).strip().strip('."')
+        desc = str(data.get("description", "")).strip()
+        if not name or len(name.split()) > NAME_MAX_WORDS + 4:
+            return None, None
+        return name, desc
+    except Exception as e:
+        print(f"    ⚠️  naming failed ({type(e).__name__}: {e}) — falling back")
+        return None, None
+
+
+# ---- Step 6: name every community --------------------------------------
+# Biggest communities first, so if MAX_COMMUNITIES_TO_NAME runs out it is the
+# SMALLEST communities that keep the fallback name, not the most important ones.
+ordered = sorted(communities.items(), key=lambda kv: len(kv[1]), reverse=True)
+
+community_records = []   # one dict per community
+llm_calls = 0
+fallbacks = 0
+
+print()
+print(f"Naming {len(ordered)} communities (LLM budget: {MAX_COMMUNITIES_TO_NAME}) …")
+
+for (level, path), nodes in ordered:
+    top_entities, entity_lines, rel_lines = _community_context(nodes)
+
+    name = desc = None
+    source = "fallback"
+
+    if len(nodes) >= MIN_COMMUNITY_SIZE_TO_NAME and llm_calls < MAX_COMMUNITIES_TO_NAME:
+        name, desc = _llm_name(entity_lines, rel_lines)
+        llm_calls += 1
+        if name:
+            source = "llm"
+
+    if not name:
+        name = _fallback_name(nodes, top_entities)
+        desc = desc or ""
+        fallbacks += 1
+
+    community_records.append({
+        "level":          level,
+        "community_path": path,
+        "size":           len(nodes),
+        "community_name": name,
+        "description":    desc,
+        "name_source":    source,
+        "top_entities":   ", ".join(_label(n) for n in top_entities[:5]),
+        "internal_edges": len(rel_lines),
+        "_nodes":         nodes,
+    })
+
+# ---- Step 7: enforce unique names --------------------------------------
+# Two different communities landing on the same name would make the name
+# useless as a handle. The path is appended only where that actually happens.
+seen = defaultdict(int)
+for rec in sorted(community_records, key=lambda r: (r["level"], -r["size"])):
+    key = (rec["level"], rec["community_name"].lower())
+    seen[key] += 1
+    if seen[key] > 1:
+        rec["community_name"] = f"{rec['community_name']} [{rec['community_path']}]"
+
+# ---- Step 8: write names back onto G -----------------------------------
+# community_names is the lookup used downstream: path -> name.
+# On each node: community_name = the name of its DEEPEST (leaf) community,
+# community_name_top = the name of its level-0 root community.
+community_names = {rec["community_path"]: rec["community_name"] for rec in community_records}
+community_descriptions = {rec["community_path"]: rec["description"] for rec in community_records}
+
+for rec in community_records:
+    for n in rec["_nodes"]:
+        G.nodes[n][f"community_name_L{rec['level']}"] = rec["community_name"]
+
+for n in G.nodes():
+    segments = G.nodes[n]["community_path"].split(".")
+    leaf_path = ".".join(segments)
+    G.nodes[n]["community_name"]     = community_names.get(leaf_path, "")
+    G.nodes[n]["community_name_top"] = community_names.get(segments[0], "")
+
+# ---- Step 9: report ------------------------------------------------------
+for rec in community_records:
+    rec.pop("_nodes", None)
+
+import pandas as pd
+communities_df = pd.DataFrame(community_records).sort_values(
+    ["level", "size"], ascending=[True, False]
+).reset_index(drop=True)
+
+print()
+print(f"Communities named   : {len(communities_df)}")
+print(f"  via LLM           : {sum(communities_df['name_source'] == 'llm')}")
+print(f"  via fallback      : {sum(communities_df['name_source'] == 'fallback')}"
+      f"  (LLM unavailable, over budget, or unusable response)")
+
+n_named_nodes = sum(1 for _, a in G.nodes(data=True) if a.get("community_name"))
+print(f"Nodes carrying a community_name : {n_named_nodes}/{G.number_of_nodes()}")
+if n_named_nodes != G.number_of_nodes():
+    print("⚠️  WARNING: some nodes have no community name.")
+
+print()
+print("Root communities (level 0), largest first:")
+for _, r in communities_df[communities_df["level"] == 0].head(15).iterrows():
+    print(f"  [{r['community_path']:>6}]  {r['size']:5d} nodes  {r['community_name']}")
+    if r["description"]:
+        print(f"            {r['description'][:110]}")
+
+try:
+    display(communities_df.drop(columns=["_nodes"], errors="ignore"))
+except NameError:
+    print(communities_df.head(30).to_string())
+
+# ---- Step 11: COMMUNITY NAME  ->  ITS NODES  (the tree view) -----------
+# One heading per community, its member entities listed underneath.
+# If SHOW_SUBCOMMUNITIES is on, each root community's sub-communities are
+# nested under it with their own names, so the hierarchy is visible.
+PRINT_LEVEL          = 0      # which level supplies the top headings (0 = root)
+SHOW_SUBCOMMUNITIES  = True   # nest the next level down under each heading
+MAX_NODES_SHOWN      = 25     # per community; None = show every node
+
+# path -> [node, ...] for the levels being printed
+_members = defaultdict(list)
+for n in G.nodes():
+    segments = G.nodes[n]["community_path"].split(".")
+    for level in (PRINT_LEVEL, PRINT_LEVEL + 1):
+        if level < max_level:
+            _members[".".join(segments[:level + 1])].append(n)
+
+
+def _node_line(n):
+    cls = G.nodes[n].get("class_name") or G.nodes[n].get("node_type") or "Unclassified"
+    deg = G_simple.degree(n) if n in G_simple else 0
+    return f"{_label(n)}  ({cls}, degree {deg})"
+
+
+def _print_nodes(nodes, indent):
+    nodes = sorted(nodes, key=lambda n: G_simple.degree(n) if n in G_simple else 0, reverse=True)
+    shown = nodes if MAX_NODES_SHOWN is None else nodes[:MAX_NODES_SHOWN]
+    for n in shown:
+        print(f"{indent}• {_node_line(n)}")
+    if len(nodes) > len(shown):
+        print(f"{indent}… and {len(nodes) - len(shown)} more")
+
+
+print()
+print("=" * 80)
+print(f"COMMUNITIES AND THEIR NODES  (headings at level {PRINT_LEVEL})")
+print("=" * 80)
+
+_top_paths = sorted(
+    (p for p in _members if len(p.split(".")) == PRINT_LEVEL + 1),
+    key=lambda p: len(_members[p]), reverse=True,
+)
+
+for path in _top_paths:
+    nodes = _members[path]
+    name  = community_names.get(path, "(unnamed)")
+    print()
+    print(f"▌ {name}   [path {path} · {len(nodes)} nodes]")
+    desc = community_descriptions.get(path, "")
+    if desc:
+        print(f"  {desc}")
+
+    child_paths = sorted(
+        (p for p in _members if p.startswith(path + ".") and len(p.split(".")) == PRINT_LEVEL + 2),
+        key=lambda p: len(_members[p]), reverse=True,
+    )
+
+    if SHOW_SUBCOMMUNITIES and child_paths:
+        covered = set()
+        for cpath in child_paths:
+            cname = community_names.get(cpath, "(unnamed)")
+            print(f"    └─ {cname}   [path {cpath} · {len(_members[cpath])} nodes]")
+            _print_nodes(_members[cpath], "         ")
+            covered.update(_members[cpath])
+        leftover = [n for n in nodes if n not in covered]
+        if leftover:
+            # nodes whose branch stopped at this level — they have no
+            # sub-community of their own, so they sit directly under the heading
+            print(f"    └─ (no sub-community · {len(leftover)} nodes)")
+            _print_nodes(leftover, "         ")
+    else:
+        _print_nodes(nodes, "    ")
+
+# Long-format table: one row per (community, node). This is the same tree
+# in a form you can filter, join or write to a table.
+community_members_df = pd.DataFrame([
+    {
+        "level":          len(path.split(".")) - 1,
+        "community_path": path,
+        "community_name": community_names.get(path, ""),
+        "node_label":     _label(n),
+        "class_name":     G.nodes[n].get("class_name") or G.nodes[n].get("node_type") or "Unclassified",
+        "degree":         G_simple.degree(n) if n in G_simple else 0,
+        "node_uri":       n,
+    }
+    for path in sorted(_members)
+    for n in _members[path]
+]).sort_values(["level", "community_path", "degree"], ascending=[True, True, False]).reset_index(drop=True)
+
+print()
+print(f"community_members_df : {len(community_members_df)} (community, node) rows")
+try:
+    display(community_members_df)
+except NameError:
+    print(community_members_df.head(30).to_string())
+
+# ---- Step 10: persist (so the LLM naming isn't lost on detach) ----------
+COMMUNITIES_PATH = "/tmp/graph_communities.csv"
+community_members_df.to_csv("/tmp/graph_community_members.csv", index=False)
+communities_df.to_csv(COMMUNITIES_PATH, index=False)
+nx.write_gexf(G, "/tmp/knowledge_graph_communities.gexf")
+print(f"\nSaved: {COMMUNITIES_PATH}")
+print("Saved: /tmp/knowledge_graph_communities.gexf  (G + community names)")
