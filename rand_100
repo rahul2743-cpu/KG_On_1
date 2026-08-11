@@ -4,3 +4,16 @@ print("Null reference:", xml_df.filter(F.col("reference").isNull()).count())
 print("Empty reference:", xml_df.filter(F.trim(F.coalesce(F.col("reference"), F.lit(""))) == "").count())
 print("Distinct reference:", xml_df.select("reference").distinct().count())
 xml_df.select("doc_id", "reference", "title").show(10, truncate=False)
+
+
+phrases = extract_query_entities("How do I open the OpenTCCM model using MTCCM?")
+seeds = link_entities(phrases)
+print(f"{len(seeds)} seeds")
+for uri, label, score, phrase in seeds[:5]:
+    print(f"  {score:5.1f}  {label}   <- '{phrase}'")
+
+edges, visited = traverse(seeds)
+print(f"\n{len(edges)} edges from {len(seeds)} seeds")
+for e in edges[:5]:
+    print(f"  hop{e['hop']} [{e['strength']}] {e['source_label']} "
+          f"--{e['predicate']}--> {e['target_label']}")
