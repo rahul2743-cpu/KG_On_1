@@ -1,0 +1,43 @@
+# ==========================================================
+# Cell 18 : ASK
+#           Give it a question, it prints the response wrapped
+#           to a readable width instead of one long line.
+# ==========================================================
+import textwrap
+
+WRAP_WIDTH = 90
+
+
+def _wrap(text, width=WRAP_WIDTH, indent=""):
+    """Wraps each line separately so blank lines (paragraph breaks) and
+    short standalone lines like commands are preserved, rather than
+    collapsed into one block by a plain textwrap.fill()."""
+    out = []
+    for line in (text or "").splitlines():
+        if not line.strip():
+            out.append("")                     # keep paragraph break
+        else:
+            out.extend(textwrap.wrap(
+                line, width=width,
+                initial_indent=indent, subsequent_indent=indent,
+                break_long_words=False,        # don't split MTCCM.Run_OpenTCCM
+                break_on_hyphens=False,
+            ))
+    return "\n".join(out)
+
+
+QUESTION = "How do I open the OpenTCCM model using MTCCM?"
+
+r = kg_answer(QUESTION, verbose=False)
+
+print("=" * WRAP_WIDTH)
+print("QUESTION")
+print("=" * WRAP_WIDTH)
+print(_wrap(r["question"]))
+
+print()
+print("=" * WRAP_WIDTH)
+print("RESPONSE")
+print("=" * WRAP_WIDTH)
+print(_wrap(r["answer"]))
+print("=" * WRAP_WIDTH)
