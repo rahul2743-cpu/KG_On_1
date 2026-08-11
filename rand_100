@@ -1,0 +1,6 @@
+from pyspark.sql import functions as F
+print("Total rows:", xml_df.count())
+print("Null reference:", xml_df.filter(F.col("reference").isNull()).count())
+print("Empty reference:", xml_df.filter(F.trim(F.coalesce(F.col("reference"), F.lit(""))) == "").count())
+print("Distinct reference:", xml_df.select("reference").distinct().count())
+xml_df.select("doc_id", "reference", "title").show(10, truncate=False)
