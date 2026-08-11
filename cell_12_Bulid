@@ -11,6 +11,17 @@
 #           Visualization is a SEPARATE step -- see Cell 13.
 #
 #           Needs: g (Cell 11)
+#
+#           FIX APPLIED: DOC_QUERY now matches ex:Asset, not
+#           ex:Document -- Cell 11 types source pages as ex:Asset,
+#           so the old query silently matched zero rows. SPARQL
+#           returns an empty result on a non-matching pattern rather
+#           than raising, which is why this failure was silent.
+#
+#           SELF-CHECK ADDED: if content nodes still come back low
+#           after this fix, the diagnostic block below traces the
+#           count back through Cell 11 and Cell 8d so the drop can
+#           be located instead of guessed at.
 # ==========================================================
 import networkx as nx
 
@@ -41,24 +52,54 @@ WHERE {
 """
 
 # ---- Step 2: pull full document content for source entities ------------
+# FIXED: ex:Asset, matching how Cell 11 actually types documents.
 DOC_QUERY = """
 PREFIX ex:   <http://knwbt.local/kg/schema/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 
 SELECT ?doc ?label ?content
 WHERE {
-    ?doc a ex:Document ;
+    ?doc a ex:Asset ;
          rdfs:label ?label ;
          ex:documentContent ?content .
 }
 """
 
+# ---- Diagnostic query: content WITHOUT the type filter -------------------
+# If DOC_QUERY (typed) returns fewer rows than this, the type filter
+# itself is the problem -- some content-bearing nodes exist under a
+# DIFFERENT rdf:type than ex:Asset. This isolates that possibility
+# instead of assuming ex:Asset is definitely the only type in use.
+CONTENT_ANY_TYPE_QUERY = """
+PREFIX ex:   <http://knwbt.local/kg/schema/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?doc ?label ?content
+WHERE {
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdfs:label ?label }
+}
+"""
+
+# ---- Diagnostic query: what rdf:type values actually appear on nodes
+# that DO have documentContent -- tells us the real type(s) in use,
+# rather than guessing between ex:Document / ex:Asset / something else.
+CONTENT_TYPES_QUERY = """
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX ex:   <http://knwbt.local/kg/schema/>
+
+SELECT ?type (COUNT(?doc) AS ?n)
+WHERE {
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdf:type ?type }
+}
+GROUP BY ?type
+"""
+
 # ---- Build the graph -----------------------------------------------------
-# Materialize the query results FIRST (not just iterate) -- this lets us
-# count exactly how many rows came back at each stage, so any silent drop
-# between Cell 10 -> Cell 11 (RDF) -> here can be caught, not assumed away.
 doc_rows_rdf = list(g.query(DOC_QUERY))
 rel_rows_rdf = list(g.query(REL_QUERY))
+doc_rows_any_type = list(g.query(CONTENT_ANY_TYPE_QUERY))
 
 G = nx.MultiDiGraph()
 
@@ -89,7 +130,6 @@ print(f"Edges (relations) : {G.number_of_edges()}")
 # DATA INTEGRITY CHECK -- verify nothing was lost at ANY handoff:
 #   document_rendered_df (Cell 8d)  ->  RDF graph g (Cell 11)  ->  G (here)
 #   triples_df (Cell 10)            ->  RDF graph g (Cell 11)  ->  G (here)
-# This does not assume the pipeline is correct -- it checks.
 # ==========================================================
 print()
 print("=" * 80)
@@ -104,15 +144,37 @@ except NameError:
     n_docs_expected = None
 
 n_docs_in_rdf = len(doc_rows_rdf)
+n_docs_any_type = len(doc_rows_any_type)
 n_docs_in_graph = sum(1 for _, a in G.nodes(data=True) if a.get("node_type") == "document")
 
-print(f"Documents  -- Cell 8d (document_rendered_df) : {n_docs_expected}")
-print(f"Documents  -- recovered from RDF (Cell 11)    : {n_docs_in_rdf}")
-print(f"Documents  -- present as nodes in G (here)     : {n_docs_in_graph}")
-if n_docs_expected is not None and n_docs_expected != n_docs_in_rdf:
-    problems.append(f"{n_docs_expected - n_docs_in_rdf} document(s) missing between Cell 8d and the RDF graph")
+print(f"Documents  -- Cell 8d (document_rendered_df)   : {n_docs_expected}")
+print(f"Documents  -- ex:documentContent, ANY type      : {n_docs_any_type}")
+print(f"Documents  -- ex:documentContent, typed ex:Asset: {n_docs_in_rdf}")
+print(f"Documents  -- present as nodes in G (here)       : {n_docs_in_graph}")
+
+if n_docs_expected is not None and n_docs_expected != n_docs_any_type:
+    problems.append(
+        f"{n_docs_expected - n_docs_any_type} document(s) missing between Cell 8d "
+        f"and the RDF graph -- this is a Cell 11 problem, not a query-filter problem"
+    )
+if n_docs_any_type != n_docs_in_rdf:
+    problems.append(
+        f"{n_docs_any_type - n_docs_in_rdf} node(s) have documentContent but are NOT "
+        f"typed ex:Asset -- the type filter in DOC_QUERY is excluding real documents. "
+        f"See the type breakdown below."
+    )
 if n_docs_in_rdf != n_docs_in_graph:
     problems.append(f"{n_docs_in_rdf - n_docs_in_graph} document(s) missing between the RDF graph and G")
+
+# If there's a gap between "any type" and "typed ex:Asset", show exactly
+# what types ARE present, so the query can be corrected precisely instead
+# of guessed at a second time.
+if n_docs_any_type != n_docs_in_rdf:
+    print()
+    print("rdf:type values found on nodes carrying documentContent:")
+    for row in g.query(CONTENT_TYPES_QUERY):
+        type_str = str(row.type) if row.type else "(no rdf:type at all)"
+        print(f"  {int(row.n):4d}  {type_str}")
 
 print()
 
@@ -129,10 +191,6 @@ print(f"Relationships -- recovered from RDF (Cell 11)   : {n_rel_in_rdf}")
 print(f"Relationships -- present as edges in G (here)    : {n_rel_in_graph}")
 if n_rel_expected is not None and n_rel_expected != n_rel_in_rdf:
     problems.append(f"{n_rel_expected - n_rel_in_rdf} relationship(s) missing between Cell 10 and the RDF graph")
-# note: n_rel_in_graph can be LESS than n_rel_in_rdf ONLY if two relationships
-# had the exact same (source, predicate, target) -- see Cell 11's own dedup
-# check, which reports that number explicitly. Any gap NOT explained by that
-# is a real loss, not expected dedup.
 
 print()
 if problems:
