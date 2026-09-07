@@ -1,0 +1,966 @@
+# ==========================================================
+# Cell 19 : KG-GROUNDED QUERY-BASED TOP-10 CHUNK RETRIEVER
+#
+#   NO LLM at retrieval time
+#   NO BM25
+#   NO embeddings
+#   NO vector search
+#
+#   Query
+#      -> KG lexical node matching
+#      -> SPARQL multi-hop traversal
+#      -> KG-grounded documents
+#      -> split documents into chunks
+#      -> score EACH chunk against the query
+#      -> combine query relevance + graph evidence
+#      -> deduplicate
+#      -> TOP 10 chunks
+#
+#   FINAL CHUNK SCORE:
+#
+#       75% Query-to-Chunk lexical relevance
+#       25% KG graph evidence
+#
+#   Therefore:
+#       KG decides WHICH DOCUMENTS are allowed
+#       Query decides WHICH CHUNKS are most relevant
+#
+#   Needs:
+#       Cell 14:
+#           PREFIXES, NODE_LABEL, HOP_DECAY, MAX_HOPS
+#
+#       Cell 16:
+#           lexical_fallback, traverse
+#
+# ==========================================================
+
+import re
+import math
+import json
+import hashlib
+from collections import defaultdict, Counter
+
+print("=" * 80)
+print("CELL 19 — KG-GROUNDED QUERY-BASED TOP-10 CHUNK RETRIEVER")
+print("=" * 80)
+
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+
+TOP_K      = 10
+CHUNK_SIZE = 900
+MIN_CHUNK  = 120
+
+# Near duplicate removal
+JACCARD   = 0.50
+SHINGLE_N = 5
+
+# Final ranking weights
+QUERY_WEIGHT = 0.75
+GRAPH_WEIGHT = 0.25
+
+
+QUERY_KG = (
+    "What steps should be taken if an Engineering Supplier Integration "
+    "Document (ESID) is not already available for a supplier?"
+)
+
+print(f"\nQuery:\n{QUERY_KG}\n")
+
+
+# ==========================================================
+# CLEANING
+# ==========================================================
+
+_MARKUP = re.compile(
+    r"\[?<doc:(?:wiki:)?[^<>]+>\]?"
+)
+
+
+def _clean(text):
+    """
+    Remove unresolved document markup and extra whitespace.
+    """
+    text = _MARKUP.sub(" ", str(text or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# ==========================================================
+# TOKENIZATION
+# ==========================================================
+
+STOPWORDS = {
+    "a", "an", "the",
+    "is", "are", "was", "were",
+    "be", "been", "being",
+    "if", "then",
+    "of", "to", "for", "from",
+    "in", "on", "at", "by",
+    "with", "without",
+    "and", "or",
+    "what", "which", "who", "where",
+    "when", "why", "how",
+    "should", "would", "could",
+    "can", "may", "might",
+    "already"
+}
+
+
+def _lex_tokens(text):
+    """
+    Simple lexical tokenizer.
+
+    Keeps meaningful terms such as:
+        engineering
+        supplier
+        integration
+        document
+        esid
+        available
+        steps
+    """
+    words = re.findall(r"[a-z0-9]+", str(text).lower())
+
+    return [
+        w for w in words
+        if len(w) > 1 and w not in STOPWORDS
+    ]
+
+
+# ==========================================================
+# CHUNK SPLITTING
+# ==========================================================
+
+def _split_chunks(text, size=CHUNK_SIZE):
+    """
+    Sentence-boundary chunking.
+
+    No overlap because duplicate/near-duplicate content
+    would consume Top-K positions.
+    """
+
+    units = [
+        u.strip()
+        for u in re.split(
+            r"(?<=[.!?])\s+|\n+",
+            text
+        )
+        if u.strip()
+    ]
+
+    chunks = []
+    buf = ""
+
+    for unit in units:
+
+        # Single sentence larger than chunk size
+        if len(unit) > size:
+
+            if buf:
+                chunks.append(buf)
+                buf = ""
+
+            for i in range(0, len(unit), size):
+                part = unit[i:i + size]
+
+                if len(part) >= MIN_CHUNK:
+                    chunks.append(part)
+
+            continue
+
+        # Add sentence to current chunk
+        if len(buf) + len(unit) + 1 <= size:
+            buf = f"{buf} {unit}".strip()
+
+        else:
+
+            if buf:
+                chunks.append(buf)
+
+            buf = unit
+
+    if buf:
+        chunks.append(buf)
+
+    return [
+        c for c in chunks
+        if len(c) >= MIN_CHUNK
+    ]
+
+
+# ==========================================================
+# DUPLICATE DETECTION
+# ==========================================================
+
+def _shingles(text, n=SHINGLE_N):
+
+    words = re.findall(
+        r"[a-z0-9]+",
+        text.lower()
+    )
+
+    return {
+        " ".join(words[i:i + n])
+        for i in range(
+            max(0, len(words) - n + 1)
+        )
+    }
+
+
+# ==========================================================
+# STEP 0 — CREATE CHUNK CORPUS
+# ==========================================================
+
+DOC_Q = PREFIXES + """
+SELECT ?doc ?label ?ref ?content
+WHERE {
+
+    ?doc ex:documentContent ?content .
+
+    OPTIONAL {
+        ?doc rdfs:label ?label
+    }
+
+    OPTIONAL {
+        ?doc ex:sourceReference ?ref
+    }
+}
+"""
+
+
+CHUNKS_BY_DOC = defaultdict(list)
+
+for row in g.query(DOC_Q):
+
+    uri = str(row.doc)
+
+    title = (
+        str(row.label)
+        if row.label
+        else NODE_LABEL.get(uri, uri)
+    )
+
+    reference = (
+        str(row.ref)
+        if row.ref
+        else uri
+    )
+
+    clean_content = _clean(
+        str(row.content)
+    )
+
+    chunks = _split_chunks(
+        clean_content
+    )
+
+    for idx, chunk in enumerate(chunks):
+
+        CHUNKS_BY_DOC[uri].append({
+
+            "content": chunk,
+
+            "title": title,
+
+            "reference": reference,
+
+            "doc_uri": uri,
+
+            "chunk_id": idx
+        })
+
+
+N_CHUNKS = sum(
+    len(chunks)
+    for chunks in CHUNKS_BY_DOC.values()
+)
+
+
+print(
+    f"Corpus            : "
+    f"{N_CHUNKS} chunks across "
+    f"{len(CHUNKS_BY_DOC)} documents"
+)
+
+
+# ==========================================================
+# STEP 1 — QUERY -> KG SEED NODES
+# ==========================================================
+
+seeds = lexical_fallback(
+    QUERY_KG,
+    limit=10
+)
+
+
+print(
+    f"\nSeed nodes        : {len(seeds)}"
+)
+
+
+for uri, label, score, path in seeds[:10]:
+
+    print(
+        f"   {score:6.2f} | "
+        f"{label[:70]}"
+    )
+
+
+if not seeds:
+
+    print(
+        "\nSTOP — "
+        "No query tokens match KG node labels."
+    )
+
+
+# ==========================================================
+# STEP 2 — KG MULTI-HOP TRAVERSAL
+# ==========================================================
+
+edges, visited = traverse(
+    seeds
+)
+
+
+print(
+    f"\nEdges traversed   : "
+    f"{len(edges)}"
+)
+
+print(
+    f"Nodes in scope    : "
+    f"{len(visited)} "
+    f"within {MAX_HOPS} hops"
+)
+
+
+# ==========================================================
+# STEP 3 — CALCULATE KG GRAPH EVIDENCE
+# ==========================================================
+
+doc_evidence = defaultdict(float)
+
+
+for edge in edges:
+
+    strength = (
+        edge["strength"] / 10.0
+    )
+
+    hop_score = (
+        HOP_DECAY **
+        (edge["hop"] - 1)
+    )
+
+    seed_score = (
+        edge["seed_score"] / 100.0
+    )
+
+
+    edge_weight = (
+        strength
+        * hop_score
+        * seed_score
+    )
+
+
+    doc_evidence[
+        edge["source"]
+    ] += edge_weight
+
+
+    doc_evidence[
+        edge["target"]
+    ] += edge_weight
+
+
+# Seed nodes themselves carry evidence
+for uri, label, score, path in seeds:
+
+    doc_evidence[uri] = max(
+        doc_evidence[uri],
+        score / 100.0
+    )
+
+
+# ==========================================================
+# ONLY KEEP DOCUMENTS GROUNDED BY KG
+# ==========================================================
+
+scoped_docs = {
+
+    uri
+
+    for uri in doc_evidence
+
+    if uri in CHUNKS_BY_DOC
+}
+
+
+print(
+    f"\nKG-grounded docs  : "
+    f"{len(scoped_docs)}"
+)
+
+
+# ==========================================================
+# STEP 4 — BUILD IDF FOR QUERY TERMS
+#
+# This is NOT BM25.
+#
+# We only use IDF to give rare query terms more importance.
+#
+# Example:
+#
+#       "ESID"        -> high importance
+#       "supplier"    -> medium
+#       "document"    -> lower
+#
+# ==========================================================
+
+QUERY_TOKENS = _lex_tokens(
+    QUERY_KG
+)
+
+
+QUERY_SET = set(
+    QUERY_TOKENS
+)
+
+
+print(
+    f"\nQuery tokens      : "
+    f"{QUERY_TOKENS}"
+)
+
+
+# Count token presence across chunks
+token_df = Counter()
+
+
+all_chunks = []
+
+for chunks in CHUNKS_BY_DOC.values():
+
+    for chunk in chunks:
+
+        all_chunks.append(
+            chunk
+        )
+
+        unique_tokens = set(
+            _lex_tokens(
+                chunk["content"]
+            )
+        )
+
+        for token in unique_tokens:
+
+            token_df[token] += 1
+
+
+TOTAL_CHUNKS = max(
+    len(all_chunks),
+    1
+)
+
+
+def _idf(token):
+
+    return (
+        math.log(
+            (TOTAL_CHUNKS + 1)
+            /
+            (token_df.get(token, 0) + 1)
+        )
+        + 1
+    )
+
+
+QUERY_IDF_TOTAL = sum(
+
+    _idf(token)
+
+    for token in QUERY_SET
+
+) or 1.0
+
+
+# ==========================================================
+# QUERY N-GRAMS
+# ==========================================================
+
+def _ngrams(tokens, n):
+
+    return {
+        tuple(tokens[i:i + n])
+
+        for i in range(
+            len(tokens) - n + 1
+        )
+    }
+
+
+QUERY_BIGRAMS = _ngrams(
+    QUERY_TOKENS,
+    2
+)
+
+
+QUERY_TRIGRAMS = _ngrams(
+    QUERY_TOKENS,
+    3
+)
+
+
+# ==========================================================
+# STEP 5 — QUERY -> CHUNK RELEVANCE SCORE
+# ==========================================================
+
+def _chunk_query_score(chunk_text):
+    """
+    Score one individual chunk against the query.
+
+    Score components:
+
+        70% weighted query token coverage
+        20% query bigram overlap
+        10% query trigram overlap
+
+    Result approximately:
+        0.0 -> unrelated
+        1.0 -> highly relevant
+    """
+
+    chunk_tokens = _lex_tokens(
+        chunk_text
+    )
+
+    if not chunk_tokens:
+
+        return 0.0
+
+
+    chunk_set = set(
+        chunk_tokens
+    )
+
+
+    # ------------------------------------------
+    # 1. Weighted query token coverage
+    # ------------------------------------------
+
+    matched_idf = sum(
+
+        _idf(token)
+
+        for token in QUERY_SET
+
+        if token in chunk_set
+
+    )
+
+
+    token_coverage = (
+        matched_idf
+        /
+        QUERY_IDF_TOTAL
+    )
+
+
+    # ------------------------------------------
+    # 2. Query bigram matching
+    # ------------------------------------------
+
+    chunk_bigrams = _ngrams(
+        chunk_tokens,
+        2
+    )
+
+
+    if QUERY_BIGRAMS:
+
+        bigram_score = (
+
+            len(
+                QUERY_BIGRAMS
+                &
+                chunk_bigrams
+            )
+
+            /
+            len(
+                QUERY_BIGRAMS
+            )
+        )
+
+    else:
+
+        bigram_score = 0.0
+
+
+    # ------------------------------------------
+    # 3. Query trigram matching
+    # ------------------------------------------
+
+    chunk_trigrams = _ngrams(
+        chunk_tokens,
+        3
+    )
+
+
+    if QUERY_TRIGRAMS:
+
+        trigram_score = (
+
+            len(
+                QUERY_TRIGRAMS
+                &
+                chunk_trigrams
+            )
+
+            /
+            len(
+                QUERY_TRIGRAMS
+            )
+        )
+
+    else:
+
+        trigram_score = 0.0
+
+
+    score = (
+
+        0.70 * token_coverage
+
+        +
+
+        0.20 * bigram_score
+
+        +
+
+        0.10 * trigram_score
+    )
+
+
+    return min(
+        score,
+        1.0
+    )
+
+
+# ==========================================================
+# STEP 6 — NORMALIZE KG DOCUMENT SCORES
+# ==========================================================
+
+if scoped_docs:
+
+    max_graph_score = max(
+
+        doc_evidence[uri]
+
+        for uri in scoped_docs
+
+    )
+
+else:
+
+    max_graph_score = 1.0
+
+
+def _normalize_graph_score(score):
+
+    if max_graph_score <= 0:
+
+        return 0.0
+
+    # Log normalization prevents one highly connected document
+    # from completely dominating other useful documents.
+
+    return (
+
+        math.log1p(score)
+
+        /
+        math.log1p(
+            max_graph_score
+        )
+    )
+
+
+# ==========================================================
+# STEP 7 — SCORE EVERY CHUNK INDIVIDUALLY
+# ==========================================================
+
+scored = []
+
+
+for uri in scoped_docs:
+
+    raw_graph_score = (
+        doc_evidence[uri]
+    )
+
+    graph_score = (
+        _normalize_graph_score(
+            raw_graph_score
+        )
+    )
+
+
+    for chunk in CHUNKS_BY_DOC[uri]:
+
+        query_score = (
+            _chunk_query_score(
+                chunk["content"]
+            )
+        )
+
+
+        # --------------------------------------
+        # FINAL SCORE
+        #
+        # Query relevance dominates.
+        #
+        # KG still matters because:
+        #
+        # 1. Only KG-grounded docs are searched
+        # 2. Graph evidence contributes 25%
+        # --------------------------------------
+
+        final_score = (
+
+            QUERY_WEIGHT
+            * query_score
+
+            +
+
+            GRAPH_WEIGHT
+            * graph_score
+        )
+
+
+        scored.append({
+
+            **chunk,
+
+            "_score":
+                final_score,
+
+            "_query_score":
+                query_score,
+
+            "_graph_score":
+                graph_score,
+
+            "_graph_evidence":
+                raw_graph_score
+        })
+
+
+# ==========================================================
+# SORT BY FINAL QUERY-AWARE SCORE
+# ==========================================================
+
+scored.sort(
+
+    key=lambda x: (
+        x["_score"],
+        x["_query_score"],
+        x["_graph_score"]
+    ),
+
+    reverse=True
+)
+
+
+# ==========================================================
+# STEP 8 — DEDUPLICATE -> TRUE TOP 10
+#
+# No per-document cap here.
+#
+# If the 10 best chunks all genuinely come from one document,
+# they are allowed.
+# ==========================================================
+
+chosen = []
+
+seen_hashes = set()
+
+seen_shingles = []
+
+
+for chunk in scored:
+
+    if len(chosen) >= TOP_K:
+
+        break
+
+
+    content = chunk[
+        "content"
+    ]
+
+
+    # Exact duplicate
+    content_hash = hashlib.md5(
+        content.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+    if content_hash in seen_hashes:
+
+        continue
+
+
+    # Near duplicate
+    shingles = _shingles(
+        content
+    )
+
+
+    duplicate = False
+
+
+    for previous in seen_shingles:
+
+        union = (
+            shingles
+            |
+            previous
+        )
+
+
+        if not union:
+
+            continue
+
+
+        similarity = (
+
+            len(
+                shingles
+                &
+                previous
+            )
+
+            /
+            len(
+                union
+            )
+        )
+
+
+        if similarity > JACCARD:
+
+            duplicate = True
+
+            break
+
+
+    if duplicate:
+
+        continue
+
+
+    chosen.append(
+        chunk
+    )
+
+    seen_hashes.add(
+        content_hash
+    )
+
+    seen_shingles.append(
+        shingles
+    )
+
+
+# ==========================================================
+# STEP 9 — RESPONSE PAYLOAD
+# ==========================================================
+
+response_kg = {
+
+    "predictions": [
+
+        {
+
+            "data": [
+
+                {
+
+                    "content":
+                        chunk["content"],
+
+                    "title":
+                        chunk["title"],
+
+                    "reference":
+                        chunk["reference"]
+
+                }
+
+                for chunk in chosen
+            ]
+
+        }
+
+    ]
+
+}
+
+
+# ==========================================================
+# DEBUG / EXPLAINABLE OUTPUT
+# ==========================================================
+
+print("\n")
+print("=" * 80)
+
+print(
+    f"TOP {len(chosen)} "
+    f"QUERY-RELEVANT KG-GROUNDED CHUNKS"
+)
+
+print("=" * 80)
+
+
+for rank, chunk in enumerate(
+    chosen,
+    1
+):
+
+    print(
+        f"\n{rank:2d}. "
+        f"FINAL={chunk['_score']:.4f} | "
+        f"QUERY={chunk['_query_score']:.4f} | "
+        f"GRAPH={chunk['_graph_score']:.4f}"
+    )
+
+    print(
+        f"    Title: "
+        f"{chunk['title'][:80]}"
+    )
+
+    print(
+        f"    Chunk: "
+        f"{chunk['content'][:250]}..."
+    )
+
+
+print("\n" + "=" * 80)
+
+print(
+    json.dumps(
+        response_kg,
+        indent=2,
+        ensure_ascii=False
+    )
+)
